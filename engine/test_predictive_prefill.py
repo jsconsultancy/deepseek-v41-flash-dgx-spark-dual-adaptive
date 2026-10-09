@@ -53,19 +53,31 @@ class PredictivePrefillTest(unittest.TestCase):
         cold.observe(f,k,rows,rows);self.assertIsNone(cold.predict(f)[0])
         self.assertIsNone(b.predict(-f)[0])
 
-    def test_persistence_rejects_incompatible_data_without_overwriting(self):
+    def test_persistence_sets_an_unusable_bank_aside_and_starts_fresh(self):
         with tempfile.TemporaryDirectory() as d:
-            path=str(Path(d)/'bank.npz');cfg=Path(d)/'config';cfg.write_text('{}')
+            path=str(Path(d)/'bank.npz');stale=Path(path+'.stale');cfg=Path(d)/'config';cfg.write_text('{}')
             b=self.bank(DSV41_PREDICTIVE_DB=path);b.configure({'x':1},cfg,cfg)
             f,k=prompt_features(list(range(60)),0);a=np.ones((2,16));b.observe(f,k,a,a);b.save()
             old=Path(path).read_bytes()
             restored=self.bank(DSV41_PREDICTIVE_DB=path);restored.configure({'x':1},cfg,cfg)
             np.testing.assert_array_equal(restored.features,b.features)
-            bad=self.bank(DSV41_PREDICTIVE_DB=path);bad.configure({'x':2},cfg,cfg)
-            self.assertFalse(bad.writable);self.assertEqual(bad.keys,[]);bad.save()
-            self.assertEqual(Path(path).read_bytes(),old)
+            self.assertIsNone(restored.reset);self.assertFalse(stale.exists())
             with np.load(path,allow_pickle=False) as z:
                 self.assertEqual(set(z.files),{'version','identity','keys','features','counts','mass'})
+            # A different configuration: the old bank becomes the one .stale copy, and the new
+            # one is empty, writable and saved under the new identity.
+            other=self.bank(DSV41_PREDICTIVE_DB=path);other.configure({'x':2},cfg,cfg)
+            self.assertTrue(other.writable);self.assertIsNone(other.io_error);self.assertEqual(other.keys,[])
+            self.assertIn('different configuration',other.reset)
+            self.assertEqual(stale.read_bytes(),old);self.assertFalse(Path(path).exists())
+            other.observe(f,k,a,a);other.save()
+            again=self.bank(DSV41_PREDICTIVE_DB=path);again.configure({'x':2},cfg,cfg)
+            self.assertEqual(again.keys,[k]);self.assertIsNone(again.reset)
+            # An unreadable file is set aside the same way, replacing the previous .stale copy.
+            Path(path).write_bytes(b'not a bank')
+            broken=self.bank(DSV41_PREDICTIVE_DB=path);broken.configure({'x':2},cfg,cfg)
+            self.assertTrue(broken.writable);self.assertEqual(broken.keys,[])
+            self.assertEqual(stale.read_bytes(),b'not a bank')
 
     @staticmethod
     def engine():

@@ -1485,7 +1485,8 @@ class V41Engine:
             self.predictive.configure(cfg, os.path.join(model_dir, 'inference', 'config.json'),
                                       os.path.join(model_dir, 'tokenizer.json'))
             log(f'predictive prefill: mode={self.predictive.mode}, samples={len(self.predictive.keys)}, '
-                f'database_error={self.predictive.io_error}')
+                f'database_error={self.predictive.io_error}'
+                + (f', reset: {self.predictive.reset}' if self.predictive.reset else ''))
         self.store.warm_start(ranked, log=log)
         if PRUNE_MISS:
             # Seed the accumulators from the persisted DB so what they hold is always the whole

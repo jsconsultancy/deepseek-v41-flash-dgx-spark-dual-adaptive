@@ -72,6 +72,7 @@ class PredictivePrefill:
         self.keys = []
         self.identity = ''
         self.io_error = None
+        self.reset = None  # why configure() set an unusable bank aside, if it did
         self.writable = True
         self.pending = None
         self.last = {'mode': self.mode, 'status': 'not_started'}
@@ -121,8 +122,17 @@ class PredictivePrefill:
                 self.counts = counts[-self.capacity:].astype(np.float32)
                 self.mass = mass[-self.capacity:].astype(np.float32)
         except Exception as exc:
-            self.io_error = str(exc)
-            self.writable = False  # preserve an incompatible/corrupt file for inspection
+            # A bank this boot cannot use is never consulted again, and keeping it read-only froze
+            # learning until someone read the health JSON: every new guard field changes the
+            # identity, so any engine update or profile edit did it. Move it aside instead -- one
+            # `.stale` copy, replaced each time -- and start an empty bank that saves.
+            stale = Path(self.path).with_name(Path(self.path).name + '.stale')
+            try:
+                os.replace(self.path, stale)
+                self.reset = f'{exc}; previous bank moved to {stale.name}, starting empty'
+            except OSError as move:
+                self.io_error = f'{exc}; could not move it aside ({move})'
+                self.writable = False  # never overwrite a bank we could not set aside
 
     def predict(self, feature):
         if len(self.keys) < self.minimum:

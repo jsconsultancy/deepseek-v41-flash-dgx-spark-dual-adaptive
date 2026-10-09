@@ -3,9 +3,9 @@
 `DSV41_PREDICTIVE_PREFILL=shadow` learns a bounded bank of prompt features and
 observed prefill routing distributions. It estimates demand before prefill and
 compares its proposed promotions with those selected from actual prefill demand.
-`apply` additionally executes the predicted plan before prefill; `off` is the
-repository default. This is experimental: similar vocabulary does not guarantee
-similar routing, and CPU speed is not evidence of selection quality.
+`apply` additionally executes the predicted plan before prefill. The engine's own default
+is `off`; the example profiles set `apply`. This is experimental: similar vocabulary does
+not guarantee similar routing, and CPU speed is not evidence of selection quality.
 
 ## Request flow
 
@@ -65,8 +65,11 @@ prompt/prefix pairs replace their previous entry. A full bank occupies about
 16.5 MiB for 40 layers × 384 experts, plus temporary working memory.
 
 The model configuration, tokenizer and guarded numerical/serving policy identify
-the bank. Incompatible or corrupt files are preserved without overwriting them;
-inspect the reported `database_error` and use a fresh path after changing policy.
+the bank. A bank from another configuration, or one that cannot be read, is moved to
+`<bank>.stale` at boot (replacing any earlier `.stale` copy) and an empty bank starts in
+its place; the boot log line `predictive prefill: ... reset: ...` says why. Until
+2026-10-09 such a bank was kept read-only instead, which silently stopped learning
+after any engine update or profile edit, since every new guard field changes the identity.
 
 ## Validation
 
