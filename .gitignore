@@ -1,0 +1,42 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.venv/
+logs/
+engram_rows/
+
+# The checkpoint is 510 GB and lives here by default. Never in git.
+models/
+
+# Private configuration and backups. Keep only the example templates.
+.env
+.env.*
+*.env
+!env.example
+!.env.example.fp4
+!.env.example.exl3
+!.env.example.exl3.allweight
+
+# New runtime and benchmark output stays local. Existing tracked historical
+# results remain in Git; routing profiles are the only newly allowed artifacts.
+/results/*
+!/results/trace-*/
+/results/trace-*/*
+!/results/trace-*/stats/
+/results/trace-*/stats/*
+!/results/trace-*/stats/coverage.json
+
+# persistent Triton JIT cache for the container path (scripts/dual-up.sh mounts it)
+.triton-cache/
+# ad-hoc container tests without the persistent-cache mount create this sibling
+.triton/
+
+# editor swap files
+*.swp
+*.swo
+*~
+
+# torch cpp_extension build cache for tools/roce (host-mounted for fast iteration)
+.roce-ext/
+tools/roce/.build/

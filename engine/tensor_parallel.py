@@ -1,0 +1,253 @@
+"""Dense TP primitives. Keep the checkpoint's rounding AFTER each complete linear.
+
+Attention shards heads/groups, not queries or shared compressed KV. Output projections
+gather inputs and disjoint results by default. The legacy reduction path remains for A/B
+tests. The vocabulary head gathers disjoint logits, without sums.
+"""
+import os
+import torch
+import torch.distributed as dist
+from engine.collective_rails import group as collective_group
+from engine import comm
+
+
+TP_DRAFT_HEAD_VERSION = 1
+
+
+def tp_draft_head_enabled():
+    """Opt in separately: DRAFT_HEAD_FMT historically had no effect with vocab TP."""
+    value = os.environ.get('DSV41_TP_DRAFT_HEAD', '0')
+    if value not in ('0', '1'):
+        raise ValueError('DSV41_TP_DRAFT_HEAD must be 0 or 1')
+    return value == '1'
+
+
+def make_tp_draft_head(head, *, load_mtp=True, source=None):
+    """Quantize this rank's draft-only vocab shard; retain the verifier and gather layout.
+
+    The separate opt-in preserves the old TP behavior when DRAFT_HEAD_FMT is left
+    at its low-level FP8 default. The format decision remains R.make_draft_head's:
+    off, an already quantized verifier and the FP32 reference do not allocate.
+    No collective runs while constructing the copy. At decode, both heads use
+    VocabParallelHead.tp_logits, including its unconditional disjoint all-gather.
+    """
+    if not tp_draft_head_enabled() or not load_mtp:
+        return None
+    if not isinstance(head, VocabParallelHead):
+        raise TypeError('TP draft head requires a VocabParallelHead verifier')
+    import v41_ref as R
+    if source is not None and not isinstance(head.local, torch.Tensor):
+        # The verifier shard is packed (DSV41_HEAD_KERNEL=packed) and has no tensor to quantize;
+        # build the draft copy from the BF16 shard it was packed from.
+        fmt = R.draft_head_fmt()
+        local = R._head_in_format(source, fmt) if fmt in ('fp8', 'fp4') else None
+    else:
+        local = R.make_draft_head(head.local)
+    return None if local is None else VocabParallelHead(local, head.world)
+
+
+def draft_head_bytes(head):
+    """Additional resident tensor bytes of a separate head, including quantization scales."""
+    if head is None:
+        return 0
+    local = head.local if isinstance(head, VocabParallelHead) else head
+    if hasattr(local, 'stored_bytes'):
+        return local.stored_bytes
+    tensors = ((local,) if isinstance(local, torch.Tensor)
+               else (local.w, local.s))
+    return sum(t.numel() * t.element_size() for t in tensors)
+
+
+def shard(weight, dim, rank, world):
+    if isinstance(weight, torch.Tensor):
+        if weight.shape[dim] % world:
+            raise ValueError('unaligned tensor shard')
+        return weight.chunk(world, dim=dim)[rank].clone().contiguous()
+    return weight.shard(dim, rank, world)
+
+
+class RowParallelWeight:
+    def __init__(self, local):
+        self.local = local
+        self.shape = local.shape
+
+    def tp_linear_act_qdq(self, x):
+        """qlinear(x, self) with act_qdq_fp8 applied inside the fp8 GEMM. This rank's x is the
+        K shard the unfused path quantizes, and shard widths are multiples of 32, so the
+        quantization groups are the same ones. Decode-sized bf16 x only (v41_ref gates it)."""
+        return self.tp_linear(x, act_qdq=True)
+
+    def tp_linear(self, x, act_qdq: bool = False):
+        import v41_ref as R
+        from fp8_linear import FP8Weight, fp8_linear
+        x = x.to(torch.bfloat16)
+        shape = x.shape
+        flat = x.reshape(-1, shape[-1])
+        if act_qdq:
+            partial = fp8_linear(flat, self.local, out_dtype=torch.float32, act_qdq=True)
+        elif isinstance(self.local, FP8Weight) and flat.size(0) <= 16:
+            partial = fp8_linear(flat, self.local, out_dtype=torch.float32)
+        else:
+            weight = self.local if isinstance(self.local, torch.Tensor) else self.local.dequant()
+            # Pad small BF16 tensor GEMMs just as R.mm does, preserving decode block invariance.
+            rows = flat.size(0)
+            if 0 < rows < R.MM_TILE:
+                flat = torch.cat((flat, flat.new_zeros(R.MM_TILE - rows, flat.size(1))))
+            partial = torch.mm(flat, weight.t(), out_dtype=torch.float32)[:rows].contiguous()
+        dist.all_reduce(partial, group=collective_group())
+        return partial.to(torch.bfloat16).view(*shape[:-1], self.shape[0])
+
+
+class OutputParallelWeight:
+    """Gather BF16 inputs, compute complete dot products for disjoint output rows.
+
+    Keeps half the weight bytes without reducing separately accumulated K partitions.
+    Both collectives concatenate values; neither introduces a floating-point sum.
+    """
+    def __init__(self, local, world=2):
+        if world != 2 or local.shape[1] % world:
+            raise ValueError('output-parallel linear requires two aligned input shards')
+        self.local, self.world = local, world
+        self.shape = (local.shape[0] * world, local.shape[1] // world)
+
+    def tp_linear_act_qdq(self, x):
+        """qlinear(x, self) with act_qdq_fp8 applied inside the fp8 GEMM, after the gather. The
+        quantization is per row and per 32-wide K group, and each rank's shard is a whole number
+        of groups, so quantizing the gathered row equals gathering quantized shards."""
+        return self.tp_linear(x, act_qdq=True)
+
+    def tp_linear(self, x, act_qdq: bool = False):
+        import v41_ref as R
+        from fp8_linear import fp8_linear
+        shape = x.shape
+        flat = x.to(torch.bfloat16).reshape(-1, shape[-1]).contiguous()
+        rows, width = flat.shape
+        gathered = torch.empty((self.world * rows, width), dtype=flat.dtype, device=flat.device)
+        comm.all_gather_fast(gathered, flat, group=collective_group())
+        full = gathered.view(self.world, rows, width).transpose(0, 1).reshape(rows, self.world * width)
+        local = (fp8_linear(full, self.local, act_qdq=True) if act_qdq
+                 else R.mm(full, self.local)).contiguous()
+        output = torch.empty((self.world * rows, local.shape[-1]), dtype=local.dtype, device=local.device)
+        comm.all_gather_fast(output, local, group=collective_group())
+        return output.view(self.world, rows, local.shape[-1]).transpose(0, 1).reshape(
+            *shape[:-1], self.shape[0])
+
+
+def shard_attention(weight, args, rank, world):
+    from fp8_linear import FP8GroupedWeight
+    from fp4_linear import FP4GroupedWeight
+    if world != 2 or not 0 <= rank < world:
+        raise ValueError('attention TP currently requires two ranks')
+    if args.n_heads % world or args.o_groups % world:
+        raise ValueError('attention heads/groups must divide TP world')
+    weight.tp_heads, weight.tp_groups = args.n_heads // world, args.o_groups // world
+    weight.wq_b = shard(weight.wq_b, 0, rank, world)
+    weight.attn_sink = shard(weight.attn_sink, 0, rank, world)
+    wo = weight.wo_a
+    if isinstance(wo, FP8GroupedWeight):
+        rows = wo.G * wo.R // world
+        lo, hi = rank * rows, (rank + 1) * rows
+        weight.wo_a = FP8GroupedWeight(wo.w[lo:hi].clone(), wo.s[lo//32:hi//32].clone(),
+                                      wo.G // world, wo.R)
+    elif isinstance(wo, FP4GroupedWeight):
+        rows = wo.G * wo.R // world
+        lo, hi = rank * rows, (rank + 1) * rows
+        # fp4 scales are one per row, not a 32x32 block, so both tables slice the row range
+        weight.wo_a = FP4GroupedWeight(wo.w[lo:hi].clone(), wo.s[lo:hi].clone(),
+                                      wo.G // world, wo.R, wo.K)
+    elif isinstance(wo, torch.Tensor):
+        weight.wo_a = shard(wo, 0, rank, world)
+    else:
+        raise ValueError('attention TP supports native FP8, FP4 or BF16 wo_a only')
+    layout = os.environ.get('DSV41_TP_LINEAR_LAYOUT', 'output')
+    if layout == 'output':
+        weight.wo_b = OutputParallelWeight(shard(weight.wo_b, 0, rank, world), world)
+    elif layout == 'intermediate':
+        weight.wo_b = RowParallelWeight(shard(weight.wo_b, 1, rank, world))
+    else:
+        raise ValueError('TP linear layout must be intermediate or output')
+
+
+class FeatureParallelEmbedding:
+    """Keep disjoint feature columns; concatenate lookups without rounding or sums.
+
+    All ranks must index the same IDs, including draft and CUDA-graph paths.
+    The caller slices on CPU before uploading to avoid a full GPU allocation.
+    """
+    def __init__(self, local, world):
+        if world != 2 or local.ndim != 2:
+            raise ValueError('embedding TP requires two feature shards')
+        self.local, self.world = local, world
+        self.shape = (local.shape[0], local.shape[1] * world)
+        self.device, self.dtype = local.device, local.dtype
+
+    def __getitem__(self, ids):
+        local = self.local[ids].contiguous()
+        flat = local.reshape(-1, local.shape[-1])
+        rows, width = flat.shape
+        gathered = torch.empty((self.world * rows, width), dtype=flat.dtype, device=flat.device)
+        comm.all_gather_fast(gathered, flat, group=collective_group())
+        return gathered.view(self.world, rows, width).transpose(0, 1).reshape(
+            *local.shape[:-1], self.shape[1])
+
+
+class VocabParallelHead:
+    def __init__(self, local, world):
+        self.local, self.world = local, world
+        self.shape = (local.shape[0] * world, local.shape[1])
+
+    def tp_logits(self, x):
+        import v41_ref as R
+        local = R.head_logits(x, self.local).contiguous()
+        flat = local.reshape(-1, local.shape[-1])
+        gathered = torch.empty((self.world * flat.shape[0], flat.shape[1]),
+                               dtype=flat.dtype, device=flat.device)
+        comm.all_gather_fast(gathered, flat, group=collective_group())
+        return gathered.view(self.world, flat.shape[0], flat.shape[1]).transpose(0, 1).reshape(
+            *x.shape[:-1], self.shape[0])
+
+    def tp_markov_greedy(self, x, embed, head_local, anchor, linear, rank):
+        """Greedy DSpark Markov chain without gathering logits: each rank biases its own vocabulary
+        half (head_local = this rank's rows of the Markov head) and only (max, global id) pairs cross
+        the network, one tiny all-gather per draft position. Ties resolve to the lower global id,
+        as a full-vocabulary argmax does. Returns (proposals [T] int64, previous-token embeddings)."""
+        import v41_ref as R
+        local = R.head_logits(x, self.local).reshape(-1, self.local.shape[0])
+        offset = rank * self.local.shape[0]
+        prev = anchor.reshape(1)
+        proposals, embeddings = [], []
+        for i in range(local.shape[0]):
+            e = embed[prev]
+            embeddings.append(e)
+            lg = local[i] + linear(e, head_local).float()[0]
+            best = lg.argmax().view(1)
+            packed = torch.cat([lg.gather(0, best),
+                                (best.to(torch.int32) + offset).view(torch.float32)]).contiguous()
+            gathered = torch.empty(self.world * 2, dtype=torch.float32, device=lg.device)
+            comm.all_gather_fast(gathered, packed, group=collective_group())
+            pairs = gathered.view(self.world, 2)
+            winner = pairs[:, 0].argmax().view(1)
+            prev = pairs[:, 1].contiguous().view(torch.int32).gather(0, winner).to(torch.int64)
+            proposals.append(prev)
+        return torch.cat(proposals), embeddings
+
+    def tp_candidates(self, x, k_local):
+        """Each rank's top-k_local logits per row, gathered: (global ids int64 [rows, world*k],
+        values fp32 [rows, world*k]), ids ascending per row so ties resolve to the lower id like a
+        full-vocabulary argmax. Only the candidates cross the network (rows*world*k*8 bytes)
+        instead of the full fp32 logits. Both ranks receive identical tensors."""
+        import v41_ref as R
+        local = R.head_logits(x, self.local).reshape(-1, self.local.shape[0])
+        rows = local.shape[0]
+        values, ids = local.topk(k_local, dim=-1)
+        packed = torch.cat([values, ids.to(torch.int32).view(torch.float32)], dim=-1).contiguous()
+        gathered = torch.empty((self.world * rows, 2 * k_local), dtype=torch.float32, device=local.device)
+        comm.all_gather_fast(gathered, packed, group=collective_group())
+        g = gathered.view(self.world, rows, 2 * k_local)
+        offset = (torch.arange(self.world, device=local.device, dtype=torch.int64)
+                  * self.local.shape[0]).view(self.world, 1, 1)
+        gids = g[..., k_local:].contiguous().view(torch.int32).to(torch.int64) + offset
+        gids = gids.permute(1, 0, 2).reshape(rows, self.world * k_local)
+        gvals = g[..., :k_local].permute(1, 0, 2).reshape(rows, self.world * k_local)
+        gids, order = gids.sort(dim=-1)
+        return gids, gvals.gather(1, order)
