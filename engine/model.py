@@ -917,6 +917,10 @@ class Model:
         """
         if getattr(self, '_prefix_replay_only', False):
             return  # Cache preparation must not count the same request a second time.
+        probe = getattr(self, '_probe_demand', None)
+        if probe is not None:
+            probe.record(logits, scores, L, k, self._moe_start)
+            return  # A discovery probe is provisional, never a history vote.
         d = 1 if decode else 0
         if PRUNE_MISS_FUSED:
             from engine import prune_miss_fused as PMF

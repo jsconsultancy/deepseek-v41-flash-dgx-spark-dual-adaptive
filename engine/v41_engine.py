@@ -1221,6 +1221,11 @@ class V41Engine:
                     or not ADAPT.record or not PREFILL_SWAP or self.user_prompt_stream
                     or self.stream_layers or self.critical.enabled):
                 raise ValueError('predictive prefill requires dynamic TP2 request-unit adaptation without streaming')
+            if self.predictive.backend == 'probe':
+                if os.environ.get('DSV41_MAX_CONCURRENCY', '1') != '1' or self.layer_ablation.path:
+                    raise ValueError('computed prefill probes require concurrency 1 and no layer ablation')
+                if self.predictive.probe.two_pass_below and not self.swa_replay:
+                    raise ValueError('two-pass suffix discovery requires SWA replay')
         self.model.user_prompt = self.user_prompt
         if self.stream_layers or self.user_prompt_stream:
             if not (self.ep.tensor_parallel and self.kernel == 'triton-fp4'
@@ -1484,7 +1489,8 @@ class V41Engine:
         if self.predictive.mode != 'off' and self.ep.rank == 0:
             self.predictive.configure(cfg, os.path.join(model_dir, 'inference', 'config.json'),
                                       os.path.join(model_dir, 'tokenizer.json'))
-            log(f'predictive prefill: mode={self.predictive.mode}, samples={len(self.predictive.keys)}, '
+            log(f'predictive prefill: mode={self.predictive.mode}, backend={self.predictive.backend}, '
+                f'samples={len(self.predictive.keys)}, '
                 f'database_error={self.predictive.io_error}'
                 + (f', reset: {self.predictive.reset}' if self.predictive.reset else ''))
         self.store.warm_start(ranked, log=log)

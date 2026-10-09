@@ -261,7 +261,7 @@ running the engine on its own. They differ only in `EXPERT_FORMAT` and the predi
 | Context allocation | 524,288 tokens, including the answer |
 | Expert memory | 92.3 GB/node; residents follow the arena (EXL3 13,813, FP4 9,793); 8 transient slots |
 | Expert selection | Global dynamic allocation, router-score ranking, high sensitivity, prior 4 |
-| Adaptation | Before prefill for familiar prompts, after prefill, during long answers, on urgent misses, and between requests |
+| Adaptation | Computed discovery before prefill, after prefill, during long answers, on urgent misses, and between requests |
 | Vision | Tower on the second node; embeddings shared with both ranks |
 | Engram row cache | 256 MiB on the head, 1,024 MiB on the worker |
 | Prompt cache | RAM reuse enabled; disk and post-response caching disabled |
@@ -288,12 +288,14 @@ The learned history survives restarts. **RAM prompt caches do not.** The retaine
 required by the current dynamic allocation mode.
 
 Dense FP4 re-quantization and expert streaming are off. Predictive prefill is on
-(`DSV41_PREDICTIVE_PREFILL=apply`): when a new prompt resembles earlier ones, the engine
-predicts its expert demand and swaps experts before prefill, and adaptation after prefill
-still corrects the guess. It needs 8 examples before it predicts, skips unfamiliar prompts,
-and keeps one bank per profile under `results/`. `shadow` learns and evaluates without
-moving experts; `off` disables it. Its selection quality is not established
-([details](docs/predictive-prefill.md)).
+(`DSV41_PROBE_PREFILL=1`): the engine computes
+expert demand from the current prompt and loads the selected experts before prefill.
+For 1–499 uncached tokens it discovers the complete new suffix, then reruns that suffix
+from the cached prefix. For 500 or more it uses excerpts capped at 64 tokens. It needs
+no training bank; the old dictionary predictor is unused. Actual prefill and decode
+continue learning residency, and post-prefill correction stays active. Set
+`DSV41_PROBE_PREFILL=0` to disable discovery. Discovery and loading add latency;
+answer-quality gains are not established ([measurements](docs/predictive-prefill.md)).
 
 Memory headroom depends on other services. Lower the arena (the resident count follows)
 or context allocation, if needed. Full-length 512K quality is not established.

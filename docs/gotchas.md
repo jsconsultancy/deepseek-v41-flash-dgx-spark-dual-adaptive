@@ -2216,3 +2216,88 @@ kernel, and only `scripts/dual-dev.sh` bind-mounts `engine/ tools/ server/` from
 every EXL3 measurement since the kernel landed ran that way. Check `kernel` (and `DSV41_DEV_SOURCE`
 in `docker inspect`) after any restart, and rebuild the image (`scripts/dual-build.sh`) whenever
 the serving code should survive a plain `dual-up.sh`.
+
+## Small computed routing probes have a fixed cost and lose context (2026-10-09)
+
+Do not equate a token fraction with a time fraction. On the native-FP4 TP2
+computed-probe gate, a 64-token probe of three 8K retrieval prompts took median
+489.8 ms including planning (9.29% of ordinary prefill), yet promotion precision
+was only 40.43% and recall 23.99%. A cached 964-token suffix paid 436.2 ms for its
+64-token probe, 49.16% of remaining prefill. Bigger probes improve selection
+agreement in the small screen but cost more; neither answer quality nor selection
+equivalence has been established. Keep the backend experimental, and evaluate
+cached workloads separately from cold long prompts. See the 2026-10-09 results.
+
+The probe uses the same router weights but different contextual hidden states:
+excerpts are joined, positions change, and omitted context no longer contributes
+attention. Real routing on this smaller sequence is still an estimate of routing
+on the full sequence. Preserve original-source Engram n-grams at each excerpt
+boundary; hashing the joined sequence invents n-grams. Cached instruction-head
+rows must not vote as if newly prefilled. Keep probe counters, KV, replay state and
+hash writes separate from the actual request, and bypass prefill FFN graphs whose
+captured recorder pointers still refer to the real request buffers.
+
+Shadow promotion evaluation is rank-0-only. The first gate reached its final
+summary and then crashed on rank 1 when it assumed that evaluation fields were
+available on both ranks. Drivers must tolerate absent rank-local telemetry and
+both ranks must still reach the final completion collective.
+
+## Topic-shift coverage gains do not establish quality or latency gains (2026-10-09)
+
+The CS/Python/news -> synthetic medical gate is more favorable to a computed
+probe than the mixed-history retrieval screen. Across three 8K medical documents,
+64-token early apply reduces median first-prefill count misses from 17.03% to
+9.35%, with ~280 early expert loads. The off-demand counterfactual still falls
+to 9.53%, so this is improved resident coverage, not only changed hidden states.
+The 64-token compute/planning ratio is 9.54%, but another 929 ms is spent loading;
+total prefill increases from 6.430 s to 7.797 s. The 256-token probe cuts misses
+to 6.85% but exceeds the 8K compute target at 12.97%. All arms answer the three
+questions correctly. Keep coverage, graded answers and latency as separate
+measurements; lower misses alone do not prove better medical reasoning.
+
+Timing is one sample per case/arm with warmed kernels and shared file/Engram
+caches. First-use 64-token prediction/planning took 1.790 s separately. Skipping
+probes during stable-topic traffic does not automatically eliminate that first
+probe cost. A topic-change trigger also cannot be inferred from this gate's
+history-demand TV: Python continuation is 0.608 and medical cases 0.615–0.625.
+The intended trigger remains unimplemented. See `RESULTS.md` and
+`results/topic-shift-20261009/` for exact workloads and matched-state checks.
+
+## Full suffix discovery must restore the actual cached context (2026-10-09)
+
+For 1–499 new tokens, starting a full pass in an empty scratch cache would lose
+the conversation context and become another approximation. The two-pass path
+starts at the actual restored prefix, protects its bounded window rings, pending
+compressor input and replay containers, then restores that boundary before real
+prefill. Compressed/index rows below prefix//ratio must stay unchanged, including
+odd prefix lengths where an unpaired old token completes a group with the first
+new token. The gate covers odd/even boundaries and new suffixes crossing a chunk
+boundary, and hashes every valid compressed/index prefix row. Counting only
+new decoder rows also changes demand: ordinary bounded replay includes cached
+tail queries, so full discovery must collect them too.
+
+At 99.80% prefix reuse, the 64-token medical turn's full discovery takes about
+0.6 s and early loading another 1.1 s for 326 experts. Its instrumented total
+prefill is 3.107 s vs 0.589 s off, including 72 later correction loads. A full
+discovery match does not make expert I/O free or guarantee identical demand after
+changing the map (apply TV 0.114). The short path intentionally exceeds the
+excerpt 10% target; telemetry marks that target not applicable. Preserve the
+earlier excerpt-negative results when using this short-input exception.
+
+The initial two-pass gate repeated the rank-1 metadata mistake: `finish` evaluates
+shadow only on rank 0. It passed cached-prefix isolation and exact routing first,
+then crashed on the peer's missing TV key. Broadcast rank-0 evaluation to both
+ranks before gate assertions; never assume every rank has evaluation fields.
+The corrected gate passed. Logs remain in `results/two-pass-prefill-20261009/`.
+
+
+### Moving the checkout while the pair is running (2026-10-09)
+
+Changing a project's source folder does not change existing containers' bind mounts
+or the image already running. Here the checkout was renamed while both ranks still
+mounted its original `results` path. The running process could read the bound history,
+but after stopping, `docker cp` and a helper using `--volumes-from` could no longer find
+it at that original path. The latest demand DB was recovered from the renamed checkout
+and copied byte-for-byte into both new checkouts before restart. Preserve live demand
+history before removing or renaming a serving checkout; validate both image code labels
+and the host paths of `results` and `.triton-cache` after boot.

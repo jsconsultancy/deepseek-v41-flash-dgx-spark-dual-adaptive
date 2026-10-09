@@ -3303,3 +3303,238 @@ continuation); MemAvailable never fell below 5.6 / 4.6 GB, against the 2.5 GB wa
 slowdown is the budget's arithmetic (2 MiB a row estimated plus a 4 GiB floor), not a measured
 shortage: with 512-row chunks 4.6 GB stayed free. Artifacts: `results/readme-20261008/` (`exl3-allweight*`,
 `allweight-stress*`, `allweight-mem.txt`, `run_allweight.sh`).
+
+## 2026-10-09 — Computed excerpt probes: early loading works, selection accuracy remains weak
+
+Implemented opt-in `DSV41_PREDICTIVE_BACKEND=probe`, independent of the existing
+off/shadow/apply mode. It runs the resident model on bounded current-prompt excerpts,
+records unmasked routing in separate counters, and uses the ordinary global planner.
+No nearest-neighbor lookup, example-bank I/O, on-demand expert streaming or complete
+second suffix prefill. Separate KV/replay state and original-source Engram n-grams
+protect the real request. See [predictive-prefill.md](docs/predictive-prefill.md).
+
+Disposable two-node native-FP4 TP2 gates used a copied production demand history,
+90.2 GB arenas, 9,570 residents, 65,536 allocated context, 2,048-row prefill chunks,
+score ranking/prior 4 and ordinary serving arithmetic. Automatic post-prefill,
+decode and idle swaps were suppressed only in this driver; the normal planner was
+retained. History was reset before each arm, and shadow/off residency stayed fixed.
+Probe token fraction was `.1` with explicit width caps; production defaults are
+`.05` and 256. These numbers do not describe the all-resident EXL3 profile.
+
+The corrected `gate-v2` passed on both ranks. For each of five cold prompts (three
+8K retrieval placements, one 32K retrieval, one 8.5K Python prompt), off/shadow
+generated tokens and **actual prefill routing demand were exactly equal**. The
+10,810-token prefix plus 964-token cached extension also retained exactly equal
+outputs/demand and exactly 10,810 reused tokens. A subsequent full hit reused all
+11,774 tokens and skipped the probe. All 16 graded rows passed: three arms on five
+questions plus one apply request, not 16 independent questions. Python was parsed
+and executed against two cases. Focused CPU coverage: 68 passing tests.
+
+Prediction time includes preparation, completed GPU work, synchronization and
+normal planning, but excludes expert-loading I/O. The denominator is ordinary
+prefill work, measured after its GPU demand readbacks, before post-prefill correction.
+The 10% target is reported, not a hard runtime cutoff. First-use allocation/JIT is
+logged separately as warmup, rather than included in the table.
+
+| Corrected gate workload | Probe tokens | Prediction/planning | Prediction / ordinary prefill | Promotion precision | Promotion recall |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 8K retrieval, median of 3 | 64 | 489.8 ms | 9.29% | 40.43% | 23.99% |
+| 8K retrieval, median of 3 | 256 | 634.7 ms | 12.01% | 60.75% | 44.95% |
+| 32K retrieval, one request | 64 | 511.9 ms | 2.46% | 35.40% | 19.18% |
+| 32K retrieval, one request | 256 | 640.2 ms | 3.18% | 60.84% | 45.08% |
+| Cached 964-token extension, one request | 64 (56 voting rows) | 436.2 ms | 49.16% | 51.50% | 30.15% |
+
+Precision/recall measure incoming expert overlap with the same planner fed actual
+prefill observations, not answer quality or full-expert ground truth. The bounded
+64-token probe meets 10% on these cold 8K examples but misses about three quarters
+of the expected promotions. It does not preserve normal post-prefill selection.
+The cached extension fails the timing target despite sampling only 64 tokens:
+small batches still pay weight, kernel and collective costs.
+
+The initial wider screen (`gate/`, same five questions) measured median prediction
+times on the three 8K retrieval questions of 603.8 / 654.2 / 767.0 / 926.6 ms for
+128 / 256 / 512 / approximately 817 actual probe tokens (cap 1,024). Promotion
+recall was 35.1 / 44.9 / 61.3 / 68.2%, with precision 55.2 / 60.8 / 73.7 / 78.6%.
+More computation improves agreement on that small screen but still exceeds the
+8K time target. A 512-token probe on one 32K request cost 776.5 ms (~3.5%), with
+70.73% precision and 55.64% recall. The first screen's request checks all passed,
+but its driver failed at the final rank-1 summary: evaluation metadata only exists
+on rank 0. Null-safe per-rank summaries fixed that harness bug; `gate-v2` then
+completed successfully. Initial timing used an entry timestamp before the final
+demand readback; the corrected gate timestamps after GPU completion.
+
+Apply integration on the corrected gate loaded **241 experts in 779.4 ms**, after
+a 64-token probe/planning phase of **485.1 ms**, before an 8,173-token real prefill.
+The graded retrieval answer passed and rank outputs agreed. Total prefill envelope
+was 6.488 s; demand TV was 0.6598. This qualifies early-load mechanics only: it is
+one question, automatic correction was suppressed, and no matched apply/off quality
+or speed claim is established. Shadow parity verifies isolation, not the quality
+of selecting different experts in apply mode.
+
+The computed backend stays experimental. The original serving image/configuration
+was restored; production demand history, nearest-neighbor bank and `.env` remained
+byte-identical to their pre-gate hashes. Source changes are in the checkout, not
+the running image. Artifacts: `results/probe-prefill-20261009/` (both gate logs and
+rank JSON, isolated history, CPU logs, production hashes and service restore log).
+
+## 2026-10-09 — CS/Python/news residency followed by a medical topic change
+
+`tools/bench_topic_shift_tp.py` tests the intended first-request use case. It
+starts with a copy of the user's existing demand DB, warms probe shapes separately,
+then runs **12 cold 8K training requests** interleaving CS notes, Python modules
+and fictional news (four of each). Normal prefill-boundary adaptation moves
+residency during training; one final history-fit pass loaded another 35 experts.
+Each measured arm starts from that exact mixed residency and history. Complete
+swap batches, including later correction, are undone in reverse order, with
+assertions on expert-to-slot placement, masks, decode LUT and adaptive counters.
+The serving history and predictor bank are never written by the driver.
+
+Same immutable native-FP4 image/source overlay and two-node TP2 setup as the probe
+qualification above: 90.2 GB arenas, 9,570 residents, 65,536 allocated context,
+2,048-row chunks, score ranking, sensitivity high, trace prior 4. Post-prefill
+and decode correction remain enabled; no idle server loop runs. Probe caps are
+64 and 256 tokens with fraction `.1`, temperature 0, seed 42. The matched cases
+are a Python continuation, three synthetic medical documents around 8K tokens
+(chart extraction, invented trial eligibility, laboratory trend arithmetic), and
+one 32K trial document. These are fixed-answer document tasks, not medical advice
+or a clinical competence evaluation. Every arm has a cold KV prefix.
+
+**Median across the three 8K medical cases:**
+
+| Arm | First-prefill count misses | First-prefill score misses | Prediction/planning | Early expert loading | Early loads | Total prefill envelope | Correct answers |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Off | 17.03% | 15.99% | 0 | 0 | 0 | 6.430 s | 3/3 |
+| Shadow, 64 tokens | 17.03% | 15.99% | 537.1 ms | 0 | 0 | 7.013 s | 3/3 |
+| Apply, 64 tokens | 9.35% | 7.85% | 535.2 ms | 929.1 ms | 280 | 7.797 s | 3/3 |
+| Apply, 256 tokens | 6.85% | 5.65% | 731.4 ms | 914.7 ms | 275 | 7.876 s | 3/3 |
+
+Misses are preferred unmasked top-k selections unavailable in the map used for
+the **first real prefill**, before normal correction. Router score mass is not
+measured expert output importance. Apply changes hidden states as well as the
+resident map. Holding the off arm's observed demand fixed and applying each early
+map gives median count misses **9.53% / 6.73%** and score misses **8.06% / 5.52%**
+for 64 / 256 tokens. Thus the coverage gain is present even on fixed demand.
+The 64-token shadow plan has median promotion precision 39.78% and recall 50.21%
+against the ordinary planner using actual demand; imperfect promotion overlap
+still reduces these workload-specific misses.
+
+The 64-token prediction uses **9.54%** of ordinary prefill time (median apply
+ratio), within the requested 10% compute target. The 256-token version uses
+**12.97%**, exceeding it on these 8K cases. Loading is additional. Total prefill
+increases by about **1.4 seconds**: early coverage improves, but this run establishes
+neither a speedup nor better answer quality. All arms answer these questions
+correctly. Timings are one run per case/arm with rotated arm order and shared
+Engram/file caches, not a repeated latency benchmark. First-use allocation/JIT
+was excluded: the separately logged first 64-token probe/planning took 1.790 s.
+A feature triggered only on topic changes can still pay that first-use cost.
+
+The Python continuation starts at 7.34% count misses / 6.48% score misses. Apply
+64 / 256 reduces those to 6.81% / 6.00% counts and 5.88% / 5.27% scores, loading
+193 / 152 experts. Its total prefill rises from 6.085 s to 8.592 / 7.258 s. The
+medical shift's coverage improvement is substantially larger in this workload.
+History-to-demand TV alone does not clearly separate the topics here: Python
+0.608, medical 0.615–0.625. No automatic shift detector has been qualified.
+
+The single 32,735-token medical trial starts at **16.95%** count misses. Apply
+64 / 256 reduces this to **11.12% / 9.08%**, loads 279 / 276 experts, and all
+answers pass. Prediction/planning costs 529.8 / 731.8 ms and loading 915.7 /
+960.2 ms. Total prefill is 24.711 s off vs 25.227 / 25.210 s apply; the shadow
+arm's 23.382 s despite its extra computation illustrates timing variability.
+
+Both ranks completed successfully: all 34 logged rows passed their grades,
+including 14 warmup/training rows and 20 comparison rows on five independent
+questions. Off/shadow generated tokens and real routing demand match exactly on
+all five cases. Every arm passes exact warmed-state restoration checks; rank
+outputs and routing demand agree throughout. Focused CPU suite: 68 tests passed.
+Original serving image/configuration restored; `.env`, production demand DB and
+nearest-neighbor bank remain byte-identical to pre-test hashes. Artifacts:
+`results/topic-shift-20261009/` (both rank JSON/logs, copied input demand,
+`warmed-state.npz`, CPU results, production hashes and service restoration log).
+
+## 2026-10-09 — Full two-pass discovery below 500 uncached tokens
+
+Added opt-in `DSV41_PROBE_TWO_PASS_BELOW=500` to the computed backend. **1–499
+uncached tokens** use complete suffix discovery with the restored cached context,
+followed by ordinary early ranking/loading and a real suffix prefill. Exactly
+500 or more retains excerpt prediction; zero new tokens skips discovery. The
+short path bypasses the normal 32-token minimum and excerpt token cap/fraction.
+Its extra prefill is intentional, exempt from the excerpt 10% compute target.
+Cached prefix states retain their historical computation. Discovery runs current
+resident weights, so loading different experts can change the real pass's demand.
+
+Discovery isolates routing counters and model replay state, saves/restores the
+bounded valid window rings and compressor inputs, and restores cache length.
+Compressed/index rows are appended after the prefix boundary; the real pass
+overwrites those rows before use. It avoids copying the complete KV cache or
+recomputing cached encoder tokens. The ordinary decoder replay still executes
+the prompt tail, including any cached rows, and those routes are recorded in full
+discovery just as they are in real prefill. Probe hashes preserve original-source
+n-grams without changing live hash state. No discovery history vote or prefix
+snapshot is persisted. The threshold and probe version 2 join the boot guard;
+full suffix discovery requires SWA replay.
+
+`tools/bench_two_pass_tp.py` passed on both native-FP4 TP2 ranks with copied
+production history, 90.2 GB arenas / 9,570 residents and 65,536 allocated context.
+It checked odd/even compressor boundaries at a ~32K prefix, including suffixes
+crossing the 2,048-row chunk boundary. Off/shadow matched generated tokens, real
+demand and final demand history exactly on **seven pairs**: cached 1/31/128/499/
+500-token suffixes, a cold 59-token medical question, and a serialized chat turn.
+Every full shadow discovery matched real routing with **TV 0**, 100% promotion
+precision/recall and exact same swaps under the same planner/history/residency.
+The 500-token arm used an excerpt; the zero-token hit skipped prediction.
+All valid compressed/index prefix rows, window tails, pending compressor inputs
+and original replay containers survived discovery unchanged.
+
+The graded serialized conversation reused **32,741 of 32,805 tokens (99.80%)**.
+Its 64 new tokens carried a synthetic medical extraction/arithmetic question:
+
+| Conversation arm | Prediction/planning | Early expert I/O | Early loads | Total prefill envelope | Graded answer |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Off | 0 | 0 | 0 | 0.589 s | pass |
+| Full shadow | 595.1 ms | 0 | 0 | 1.438 s | pass |
+| Full apply | 585.8 ms | 1,097.7 ms | 326 | 3.107 s | pass |
+
+Apply also made 72 ordinary post-prefill corrections; predicted vs final demand
+TV was 0.114 after the early map changed. The full shadow demand match applies
+before changing residents, not to an all-expert oracle or a guarantee of identical
+routing after loading. These are one-sample, instrumented timings: the gate also
+hashes valid prefix state before/after discovery. They establish mechanics and
+record the added cost, not a latency or quality improvement. All 11 graded rows
+pass (six medical rows on the same question plus five READY seed rows); rank
+outputs, routing and history agree on all 31 logged rows.
+
+The first gate passed its first cached-suffix check, then its driver crashed on
+rank 1 reading rank-0-only evaluation metadata. The corrected driver broadcasts
+that evaluation before assertions, and `gate-v2` completes on both ranks. The
+failed logs are retained. CPU checks: 71 unit tests plus four functional
+prefix-cache checks passed. Production demand DB and nearest bank remain
+byte-identical to pre-test hashes; testing used only their copied input history.
+
+Enabled the hybrid on the serving pair in `deepseek-v41-flash-spark:20261009-probe`
+(native runtime from the prior image, qualified source overlay). Serving keeps
+the prior 92.3 GB arena / 524,288 context configuration and apply mode, uses
+computed prediction with a 64-token cap / `.1` fraction for larger suffixes and
+full discovery below 500. Artifacts: `results/two-pass-prefill-20261009/`
+(both gate runs, rank JSON, CPU checks, copied history, prior/enabled configuration,
+image build/transfer logs and hybrid service boot log).
+
+
+### 2026-10-09 — one computed-prefill switch, deployed from the adaptive checkout
+
+The active `.env` and all three dual-node profiles use `DSV41_PROBE_PREFILL=1`,
+which selects computed apply directly. `0` disables discovery even if legacy
+predictor variables are present. All `DSV41_PREDICTIVE_*` entries were removed
+from `.env`, `.env.example.*` and `env.example`; the generic TP recipe documents
+only the new switch. The 64-token cap, `.1` fraction and strict below-500 full
+suffix threshold remain. No routing or numerical policy changed in this cleanup.
+
+68 focused CPU tests passed, including apply selection, explicit disable despite
+legacy apply settings, rejection of ambiguous switch values, and provisional
+planning without bank writes. Both ranks booted the identical immutable image
+`sha256:cd226626f7e62ea59eeb148c1ea769cde6a3e9cf220be2c2d53801eabdb7a1df`,
+with code digest `214d86a091343b35` matching the adaptive checkout. Their results
+and kernel-cache mounts now point to `deepseek-v41-flash-dgx-spark-dual-adaptive`.
+Health reports `mode=apply`, `backend=probe`; no legacy predictor variables are
+present in the serving environment. The latest learned demand DB was preserved
+byte-for-byte on both nodes through boot. This is a deployment/configuration
+check, not a new speed or answer-quality measurement.

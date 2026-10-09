@@ -1,4 +1,4 @@
-"""Bounded prompt-to-routing predictor; no extra forward pass or expert streaming.
+"""Provisional demand from a bounded example bank or a computed excerpt probe.
 
 Rank 0 owns a bank of hashed text features and measured prefill distributions.
 Predictions are provisional ONE-request votes passed to the existing planner.
@@ -56,13 +56,29 @@ def prompt_features(tokens, prefix):
 class PredictivePrefill:
     def __init__(self, layers, experts, env=None):
         env = os.environ if env is None else env
-        self.mode = env.get('DSV41_PREDICTIVE_PREFILL', 'off')
-        if self.mode not in ('off', 'shadow', 'apply'):
-            raise ValueError('DSV41_PREDICTIVE_PREFILL must be off, shadow or apply')
-        self.path = env.get('DSV41_PREDICTIVE_DB', 'results/predictive-prefill.npz')
-        self.capacity = int(env.get('DSV41_PREDICTIVE_CAPACITY', '128'))
-        self.minimum = int(env.get('DSV41_PREDICTIVE_MIN_SAMPLES', '8'))
-        self.similarity = float(env.get('DSV41_PREDICTIVE_MIN_SIMILARITY', '.85'))
+        enabled = env.get('DSV41_PROBE_PREFILL')
+        if enabled is not None:
+            if enabled not in ('0', '1'):
+                raise ValueError('DSV41_PROBE_PREFILL must be 0 or 1')
+            self.mode = 'apply' if enabled == '1' else 'off'
+            self.backend = 'probe'
+        else:
+            # Compatibility for old installations and explicit shadow qualification.
+            self.mode = env.get('DSV41_PREDICTIVE_PREFILL', 'off')
+            if self.mode not in ('off', 'shadow', 'apply'):
+                raise ValueError('DSV41_PREDICTIVE_PREFILL must be off, shadow or apply')
+            self.backend = env.get('DSV41_PREDICTIVE_BACKEND', 'nearest')
+            if self.backend not in ('nearest', 'probe'):
+                raise ValueError('DSV41_PREDICTIVE_BACKEND must be nearest or probe')
+        self.probe = None
+        if self.backend == 'probe':
+            from engine.probe_prefill import SmallProbe
+            self.probe = SmallProbe(env)
+        bank_env = env if self.backend == 'nearest' else {}
+        self.path = bank_env.get('DSV41_PREDICTIVE_DB', 'results/predictive-prefill.npz')
+        self.capacity = int(bank_env.get('DSV41_PREDICTIVE_CAPACITY', '128'))
+        self.minimum = int(bank_env.get('DSV41_PREDICTIVE_MIN_SAMPLES', '8'))
+        self.similarity = float(bank_env.get('DSV41_PREDICTIVE_MIN_SIMILARITY', '.85'))
         if not 1 <= self.minimum <= self.capacity <= 256 or not 0 < self.similarity <= 1:
             raise ValueError('invalid predictive prefill capacity/minimum/similarity')
         self.shape = (layers, experts)
@@ -75,14 +91,18 @@ class PredictivePrefill:
         self.reset = None  # why configure() set an unusable bank aside, if it did
         self.writable = True
         self.pending = None
-        self.last = {'mode': self.mode, 'status': 'not_started'}
+        self.last = {'mode': self.mode, 'backend': self.backend, 'status': 'not_started'}
 
     def boot_fields(self):
         return dict(predictive_version=VERSION, predictive_mode=self.mode,
+                    predictive_backend=self.backend,
                     predictive_capacity=self.capacity, predictive_minimum=self.minimum,
-                    predictive_similarity=self.similarity, predictive_features=FEATURES)
+                    predictive_similarity=self.similarity, predictive_features=FEATURES,
+                    **(self.probe.boot_fields() if self.probe is not None else {}))
 
     def configure(self, cfg, model_config, tokenizer):
+        if self.backend == 'probe':
+            return  # Computed demand needs no example bank and must not open its file.
         # Reuse across ranking/history changes, but never across model, tokenizer,
         # numerical/serving-policy changes. Database is rank-0 authoritative.
         stable = {k:v for k,v in cfg.items() if not k.startswith('predictive_')
@@ -183,14 +203,21 @@ class PredictivePrefill:
             return
         self.pending = None
         started = time.perf_counter()
+        # This backend executes a distributed model pass. Both ranks call it;
+        # putting it inside the rank-0 planning branch would hang the pair.
+        probe_result = self.probe.predict(engine, tokens, prefix) if self.probe is not None else None
         packet = None
         if engine.ep.rank == 0:
-            report = dict(mode=self.mode, status='skipped', samples=len(self.keys), swaps=0,
+            report = dict(mode=self.mode, backend=self.backend, status='skipped', samples=len(self.keys), swaps=0,
                           new_tokens=len(tokens)-prefix)
             packet = dict(report=report, swaps=[])
             try:
                 from engine.v41_engine import ADAPT
-                if getattr(engine, '_images', None) is not None:
+                if probe_result is not None:
+                    demand, info = probe_result
+                    report.update(info)
+                    feature = key = None
+                elif getattr(engine, '_images', None) is not None:
                     report['status'] = 'skip_vision'
                 elif len(tokens)-prefix < ADAPT.swap_prefill_min:
                     report['status'] = 'skip_short_or_cached'
@@ -198,16 +225,21 @@ class PredictivePrefill:
                     feature, key = prompt_features(tokens, prefix)
                     demand, info = self.predict(feature)
                     report.update(info)
+                if probe_result is not None or report['status'] not in ('skip_vision', 'skip_short_or_cached'):
                     planned = []
                     if demand is not None:
                         masks = np.stack([engine.model_prune_mask[L].cpu().numpy() for L in range(self.shape[0])])
-                        predicted_miss = float((demand[0] * ~masks).sum()/self.shape[0])
+                        counts_vote = normalize(demand[0]) if self.probe is not None else demand[0]
+                        predicted_miss = float((counts_vote * ~masks).sum()/self.shape[0])
                         report['predicted_miss_rate'] = predicted_miss
                         if predicted_miss >= ADAPT.swap_prefill_min_miss:
                             planned = engine.plan_swaps(max_swaps=ADAPT.swap_max, request_demand=demand)
                         else:
                             report['status'] = 'below_miss_gate'
-                    self.pending = dict(feature=feature, key=key, demand=demand, plan=planned)
+                    # Skipped probes have no observations to evaluate. Nearest
+                    # lookup still collects unfamiliar eligible prompts.
+                    if self.probe is None or demand is not None:
+                        self.pending = dict(feature=feature, key=key, demand=demand, plan=planned)
                     report['planned_swaps'] = len(planned)
                     if self.mode == 'apply':
                         packet['swaps'] = planned
@@ -229,6 +261,8 @@ class PredictivePrefill:
                 traceback.print_exc()
                 os._exit(1)
         self.last['load_ms'] = round(1000*(time.perf_counter()-load_start), 3)
+        if self.pending is not None:
+            self.pending['prefill_started'] = time.perf_counter()
 
     def finish(self, engine):
         if self.mode == 'off' or engine.ep.rank != 0 or self.pending is None:
@@ -239,6 +273,18 @@ class PredictivePrefill:
             from engine.v41_engine import ADAPT
             counts = engine.model._req_counts.cpu().numpy().copy()
             mass = engine.model._req_mass.cpu().numpy().copy()
+            if self.probe is not None:
+                # These GPU-to-host copies drain the preceding prefill work.
+                # The timestamp on entry could otherwise omit queued tail/head
+                # kernels and overstate the prediction/prefill time ratio.
+                prefill_ms = 1000 * (time.perf_counter() - pending['prefill_started'])
+                ratio = self.last['prediction_ms'] / max(prefill_ms, 1e-9)
+                self.last.update(observed_prefill_ms=round(prefill_ms, 3),
+                                 prediction_prefill_ratio=ratio,
+                                 # Full short-suffix discovery intentionally spends a
+                                 # second prefill; the excerpt's 10% goal does not apply.
+                                 probe_within_target=(None if self.last.get('prediction_kind') == 'full_suffix'
+                                                      else ratio <= self.probe.target_ratio))
             if pending['demand'] is not None:
                 actual = normalize(mass if ADAPT.metric == 'score' else counts)
                 estimated = normalize(pending['demand'][1 if ADAPT.metric == 'score' else 0])
@@ -250,8 +296,13 @@ class PredictivePrefill:
                     before = engine._miss_at_request_start
                     denom = measured_miss[1]-before[1]
                     rate = (measured_miss[0]-before[0])/denom if denom > 0 else 0.
+                    vote_miss = float((normalize(counts) * ~np.stack([
+                        engine.model_prune_mask[L].cpu().numpy() for L in range(self.shape[0])])).sum()/self.shape[0])
+                    # Full discovery has exactly the ordinary demand; compare the
+                    # same per-layer miss gate used by begin (not token-weighted).
+                    gate = vote_miss if self.last.get('prediction_kind') == 'full_suffix' else rate
                     target = (engine.plan_swaps(max_swaps=ADAPT.swap_max, request_demand=(counts,mass))
-                              if rate >= ADAPT.swap_prefill_min_miss else [])
+                              if gate >= ADAPT.swap_prefill_min_miss else [])
                     expected = {tuple(s[:4]) for s in target}
                     predicted = {tuple(s[:4]) for s in pending['plan']}
                     # Promotion overlap is more meaningful than exact donor pairing.
@@ -261,9 +312,10 @@ class PredictivePrefill:
                         promotion_precision=(len(expected_in & predicted_in)/len(predicted_in) if predicted_in else None),
                         promotion_recall=(len(expected_in & predicted_in)/len(expected_in) if expected_in else None),
                         exact_swap_overlap=len(expected & predicted))
-            self.observe(pending['feature'], pending['key'], counts, mass)
-            self.save()
-            self.last['samples_after'] = len(self.keys)
+            if self.probe is None:
+                self.observe(pending['feature'], pending['key'], counts, mass)
+                self.save()
+                self.last['samples_after'] = len(self.keys)
         except Exception as exc:
             self.last.update(observation_error=type(exc).__name__)
         self.last['observation_ms'] = round(1000*(time.perf_counter()-started), 3)
