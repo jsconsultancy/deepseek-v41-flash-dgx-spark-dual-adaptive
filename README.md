@@ -155,8 +155,11 @@ git clone https://github.com/raspy135/deepseek-v41-flash-dgx-spark-dual-adaptive
 **1. Pick a profile** (on the head):
 
 ```bash
-cp .env.example.exl3 .env      # EXL3 experts (default): faster decode, 90% resident
-cp .env.example.fp4 .env       # or FP4: the checkpoint's own expert weights, no packs
+cp .env.example.exl3 .env           # EXL3 experts (default): faster decode, 90% resident
+or
+cp .env.example.exl3.allweight .env # EXL3 experts, 100% resident
+or
+cp .env.example.fp4 .env            # or FP4: the checkpoint's own expert weights, no packs
 ```
 
 Set `MODEL_DIR`, `PEER`, `MASTER_ADDR`, `NCCL_SOCKET_IFNAME` and
