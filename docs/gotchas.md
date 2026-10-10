@@ -2301,3 +2301,31 @@ it at that original path. The latest demand DB was recovered from the renamed ch
 and copied byte-for-byte into both new checkouts before restart. Preserve live demand
 history before removing or renaming a serving checkout; validate both image code labels
 and the host paths of `results` and `.triton-cache` after boot.
+
+## A typed `<｜deepseek_image｜>` is text, not an image (2026-10-10)
+
+Reported by the DeepSeek Harness as
+`400 cannot encode messages: Message content contains image special token '<｜deepseek_image｜>'`.
+The harness (and any agent that reads this repo, its logs, or the checkpoint's
+`encoding/encoding.py`) puts the literal into a tool result, and the checkpoint's reference
+encoder refuses the whole request when it sees it in `content` or `reasoning_content`. The
+refusal is right about the danger -- the tokenizer reads that byte string as image id 129264,
+an image with no pixels behind it -- but it takes every *later* turn of that conversation with
+it, because the offending message is now permanent history.
+
+The server escapes the literal before the encoder runs: `escape_image_tokens` replaces it with
+`<` + U+200B + `｜deepseek_image｜>`, which tokenises as ordinary BPE and can never be id 129264.
+That covers message text, `reasoning_content`, tool results, tool-call arguments, tool schemas
+and a `response_format` schema, and `/v1/completions` escapes raw text as well. Tool-call
+arguments are decoded from their JSON string and re-encoded, because a Python client's
+`json.dumps` writes the fullwidth bars as `\uff5c` and a raw substring replace would miss them.
+Real image blocks never pass through the escape: the encoder inserts their placeholder after
+that point, once the pixels exist, so a genuine image is still the only way the id reaches the
+model. The price is eight ordinary tokens where the model used to read one reserved id; that is
+the point, because the id had no image behind it.
+
+Related, not fixed: `_reject_images` counts an `input_image` block as an image (so it is not
+refused for lack of a vision tower), but the checkpoint encoder's `_process_image_blocks` only
+knows `image` and `image_url`. An `input_image` block therefore renders as
+`[Unsupported input_image]` and its pixels are dropped silently. No client in the DSH incident
+sent one; a Responses-API client would need this normalised to `image_url` first.

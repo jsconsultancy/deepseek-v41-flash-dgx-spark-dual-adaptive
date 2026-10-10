@@ -86,6 +86,13 @@ message is inserted if the conversation does not start with one). The prompt str
 with `add_special_tokens=False` -- it already contains BOS and every role/think token. The
 generation starts right after `<｜Assistant｜><think>` (thinking) or `<｜Assistant｜></think>` (chat).
 
+Before the encoder runs, a client-typed `<｜deepseek_image｜>` anywhere in `messages`, `tools` or a
+`response_format` schema is split with a zero-width space (`escape_image_tokens` in `app.py`).
+The reference encoder refuses the whole request for the literal, because the tokenizer would
+read it as image id 129264 with no pixels behind it; an agent that reads this repo's own sources
+puts that literal into a tool result, and the refusal would wedge every later turn. The escaped
+form tokenises as ordinary BPE, so a real image block is the only path to the image id.
+
 ## Output handling
 
 * Bursts of token ids are detokenized incrementally; text is released only when the decode is

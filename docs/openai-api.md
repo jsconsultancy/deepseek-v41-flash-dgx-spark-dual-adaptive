@@ -18,13 +18,21 @@ sees, and how to point a normal OpenAI client at it.
 | `POST /v1/completions` | raw `prompt` (string or token ids). No chat template, no thinking parsing — the text comes back verbatim |
 | `POST /v1/debug/prompt` | same body as chat; returns the rendered prompt, its token ids and the resolved thinking/effort **without touching the engine**. On this recipe a prefill is minutes of NVMe streaming, so this is how the benchmark measures prompt lengths |
 
-Rejected with HTTP 400: `n > 1`, images, `logprobs`. Errors are OpenAI-shaped
-(`{"error": {"message","type","param","code"}}`); a failure mid-stream arrives as a
-`data: {"error": ...}` event followed by `data: [DONE]`.
+Rejected with HTTP 400: `n > 1`, images when no vision tower is loaded, `logprobs`. Errors
+are OpenAI-shaped (`{"error": {"message","type","param","code"}}`); a failure mid-stream
+arrives as a `data: {"error": ...}` event followed by `data: [DONE]`.
 
 Message roles are `system`, `user`, `assistant` and `tool`. `developer` — the name OpenAI's
 newer models use for `system`, which some harnesses send unprompted — is accepted and folded
 into `system` (mid-conversation included); any other role is a 400.
+
+A *typed* `<｜deepseek_image｜>` in any text field (message content, `reasoning_content`, a tool
+result, tool-call arguments, a tool schema) is not refused and is not the image token: the
+server splits it with a zero-width space before the reference encoder sees it, so it reads as
+ordinary text and the reserved id 129264 never appears without an image behind it. Images
+still travel as content blocks. This is what lets an agent read this repo's own sources — which
+contain the literal — without wedging the conversation, and it is why DeepSeek Harness works
+against this server.
 
 ## Thinking and reasoning effort
 

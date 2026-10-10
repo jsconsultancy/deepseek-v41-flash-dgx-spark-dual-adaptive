@@ -275,6 +275,51 @@ def _reject_images(messages: List[dict]) -> None:
                                             "(no vision tower loaded)", param=f"messages[{i}].content")
 
 
+# A *typed* `<｜deepseek_image｜>` is refused by the checkpoint's reference encoder, because the
+# tokenizer reads that byte string as the reserved image id 129264 -- an image with no pixels
+# behind it. That is a reasonable thing to refuse, but the refusal takes the whole request with
+# it, and coding agents put the literal into tool results simply by reading this repo's sources,
+# logs or the checkpoint's own `encoding.py`. Split the token with a zero-width space instead:
+# the prompt reads the same characters as ordinary BPE, and the image id never appears without
+# an image to splice. Real image blocks do not pass through here -- the encoder turns those into
+# the placeholder after this point, once their pixels are known to exist.
+IMAGE_TOKEN = "<｜deepseek_image｜>"
+IMAGE_TOKEN_ESCAPED = "<\u200b｜deepseek_image｜>"  # zero-width space after "<", invisible but not the id
+
+
+def escape_image_tokens(obj: Any) -> Any:
+    """Replace a client-typed image placeholder in every string of a request structure.
+
+    Applied to `messages`, `tools` and a `response_format` schema before the reference encoder
+    sees them. Image URLs and base64 payloads are never a bare placeholder, so the substitution
+    only ever touches text a client actually typed. Tool-call arguments arrive as a JSON string;
+    a Python client's `json.dumps` writes the fullwidth bars as `\\uff5c`, which a raw substring
+    replace would miss, so those are decoded, escaped and re-serialised instead."""
+    if isinstance(obj, str):
+        return obj.replace(IMAGE_TOKEN, IMAGE_TOKEN_ESCAPED) if IMAGE_TOKEN in obj else obj
+    if isinstance(obj, list):
+        return [escape_image_tokens(v) for v in obj]
+    if isinstance(obj, dict):
+        function = obj.get("function")
+        if isinstance(function, dict) and isinstance(function.get("arguments"), str):
+            obj = dict(obj)
+            obj["function"] = dict(function, arguments=_escape_json_string(function["arguments"]))
+        return {k: escape_image_tokens(v) for k, v in obj.items()}
+    return obj
+
+
+def _escape_json_string(value: str) -> str:
+    """Escape a JSON-encoded tool-call argument string without trusting its shape.
+
+    The reference encoder parses these with `json.loads` and renders the decoded values, so an
+    escaped placeholder has to be re-encoded as JSON, not spliced into the source bytes."""
+    try:
+        decoded = json.loads(value)
+    except (ValueError, TypeError):
+        return escape_image_tokens(value)
+    return json.dumps(escape_image_tokens(decoded), ensure_ascii=False)
+
+
 # DSV41_LOG_PROMPT=1 logs the RENDERED prompt of every request -- what the model actually sees
 # after chat templating, thinking tags and tool rendering, which is usually not what the caller
 # thinks it sent. Off by default because it writes user content to the log.
@@ -324,6 +369,9 @@ def build_chat_prompt(body: dict, enc, tok: Tok, thinking: bool,
     for m in messages:
         if m["role"] == "developer":
             m["role"] = "system"
+    # Escape before _reject_images and before the reference encoder: a typed placeholder is text,
+    # not an image request, and it must not reach the tokenizer as id 129264.
+    messages = escape_image_tokens(messages)
     _reject_images(messages)
 
     # Tools and response_format ride on the first message; the encoder only
@@ -333,10 +381,12 @@ def build_chat_prompt(body: dict, enc, tok: Tok, thinking: bool,
         tools = None
     if tools is not None and not isinstance(tools, list):
         raise APIError(400, "`tools` must be a list", param="tools")
+    # The schemas are rendered into the prompt too, so a typed placeholder can hide there.
+    tools = escape_image_tokens(tools)
     schema = None
     rf = body.get("response_format")
     if isinstance(rf, dict) and rf.get("type") == "json_schema":
-        schema = (rf.get("json_schema") or {}).get("schema")
+        schema = escape_image_tokens((rf.get("json_schema") or {}).get("schema"))
     if tools or schema:
         if messages[0]["role"] != "system":
             messages.insert(0, {"role": "system", "content": ""})
@@ -1315,6 +1365,9 @@ class Handler(BaseHTTPRequestHandler):
         if isinstance(prompt, list) and len(prompt) == 1 and isinstance(prompt[0], (str, list)):
             prompt = prompt[0]
         if isinstance(prompt, str):
+            # Raw text goes straight to the tokenizer, so a typed placeholder would become the
+            # image id with no image behind it. Escape it here too, for the same reason as chat.
+            prompt = escape_image_tokens(prompt)
             prompt_ids = st.tok.encode(prompt)
             if body.get("add_bos", True) and st.bos_id is not None and (not prompt_ids or prompt_ids[0] != st.bos_id):
                 prompt_ids = [st.bos_id] + prompt_ids

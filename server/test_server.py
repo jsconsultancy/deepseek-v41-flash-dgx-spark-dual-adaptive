@@ -203,6 +203,39 @@ def test_developer_role_is_folded_into_system():
     assert developer_tools["prompt_ids"] == system_tools["prompt_ids"]
 
 
+def test_typed_image_placeholder_is_escaped_not_rejected():
+    """A coding agent puts the literal image token into a tool result by reading this repo or the
+    checkpoint's own `encoding.py`. The reference encoder refuses the whole request for it, which
+    would wedge every later turn of that conversation. The server splits the token with a
+    zero-width space instead, so it reads as ordinary text and never becomes image id 129264 with
+    no pixels behind it. This exact failure was reported against the DeepSeek Harness."""
+    token = "<｜deepseek_image｜>"
+    tools = [{"type": "function", "function": {
+        "name": "grep", "description": "find " + token,
+        "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}}}]
+    status, r = post("/v1/debug/prompt", {
+        "tools": tools,
+        "response_format": {"type": "json_schema", "json_schema": {
+            "name": "x", "schema": {"type": "object", "description": token}}},
+        "messages": [
+            {"role": "user", "content": "read this: " + token},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "1", "type": "function", "function": {
+                    "name": "grep", "arguments": json.dumps({"q": token})}}]},
+            {"role": "tool", "tool_call_id": "1", "content": "stdout: " + token},
+            {"role": "assistant", "reasoning_content": "I saw " + token, "content": "ok"},
+            {"role": "user", "content": "again"}]})
+    assert status == 200, r
+    assert token not in r["prompt"], r["prompt"]
+    assert "\u200b" in r["prompt"] and "deepseek_image" in r["prompt"]
+    assert 129264 not in r["prompt_ids"], r["prompt_ids"]
+    # /v1/completions tokenizes raw text directly, so it has to escape too. The bare escaped
+    # token is 8 BPE pieces, not the single image id; the mock reports prompt_tokens as the ids.
+    status, r = post("/v1/completions", {"model": "x", "prompt": token, "max_tokens": 2})
+    assert status == 200, r
+    assert r["usage"]["prompt_tokens"] >= 8, r["usage"]
+
+
 def test_chat_nonstream_thinking_off_default():
     status, r = chat()
     assert status == 200, r
