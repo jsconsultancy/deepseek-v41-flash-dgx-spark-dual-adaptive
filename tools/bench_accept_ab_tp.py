@@ -89,6 +89,11 @@ CONFIGS['h_fp8'] = dict(CONFIGS['x3d_on'], head_fmt='fp8', draft_head='fp8')
 # greedy outputs must stay bit-identical; the acceptance delta is the unlisted tokens' cost.
 CONFIGS['vocab_full'] = dict(CONFIGS['x3d_on'], draft_vocab=False)
 CONFIGS['vocab_listed'] = dict(CONFIGS['x3d_on'], draft_vocab=True)
+# Lossy decode pruning of low-share routed picks (engine/expert_topp.py). Load with
+# DSV41_EXPERT_TOPP=0.90 so the slot table carries the pruned-pick column; the off arm sets the rule
+# to None at runtime. Target numerics change, so outputs differ and acceptance is part of the cost.
+CONFIGS['topp_off'] = dict(CONFIGS['x3d_on'], expert_topp=None)
+CONFIGS['topp90'] = dict(CONFIGS['x3d_on'], expert_topp=(0.90, 3))
 for _qkv, _sh, _attn in ((24, 16, 4), (24, 16, 12), (12, 0, 4), (24, 0, 4), (0, 16, 4)):
     CONFIGS[f'cand_q{_qkv}_s{_sh}_a{_attn}'] = dict(CONFIGS['draft_fp8_split'], qkv_mb=_qkv, sh_mb=_sh, attn_mb=_attn)
 
@@ -199,6 +204,9 @@ def set_config(e, cfg):
             'load with DSV41_DRAFT_VOCAB=<ranking> DSV41_BENCH_DRAFT_VOCAB_AB=1'
         fd.draft_head = e.W.draft_head if cfg['draft_vocab'] else full
         fd.set_markov_fmt(fd.markov_fmt)  # the split chain's Markov rows follow the head's ids
+    if 'expert_topp' in cfg:
+        assert fd.topp_sentinel is not None, 'load with DSV41_EXPERT_TOPP=0.90'
+        fd.expert_topp = cfg['expert_topp']   # read by _layer_a at capture; set_config released graphs
     if 'markov_fmt' in cfg:
         fd.set_markov_fmt(cfg['markov_fmt'])
     if 'early_draft' in cfg:
@@ -292,7 +300,7 @@ def main():
     usable = [i for i in range(len(ids)) if by[(i, args.a)]['steps'] >= 8 and by[(i, args.b)]['steps'] >= 8]
     # Target arithmetic keys; draft-only and exact-schedule (fp8_bn/fp8_bk) differences must leave
     # greedy outputs bit-identical, so those A/Bs assert it.
-    target_keys = list(CONFIGS['base']) + ['rms_fused', 'hc_front_fused', 'x3', 'head_fmt'] + list(_PREFILL_OFF)
+    target_keys = list(CONFIGS['base']) + ['rms_fused', 'hc_front_fused', 'x3', 'head_fmt', 'expert_topp'] + list(_PREFILL_OFF)
     draft_only = all(CONFIGS[args.a].get(k) == CONFIGS[args.b].get(k) for k in target_keys)
     report['summary'] = {
         'draft_only': draft_only,

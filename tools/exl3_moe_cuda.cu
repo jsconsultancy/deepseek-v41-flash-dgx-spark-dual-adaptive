@@ -638,8 +638,11 @@ __global__ void down_combine_kernel(const float* __restrict__ Z, const int* __re
             y[(size_t)p * D + n + j] = o[j];
         }
     } else {
+        // A negative pick is in no group (group_small_kernel), so Z holds nothing of it and y was
+        // never written: its term is exactly 0. Reading y here (uninitialized) could feed a NaN
+        // into the sum even at weight 0 -- DSV41_EXPERT_TOPP's pruned picks take this branch.
 #pragma unroll
-        for (int j = 0; j < 4; ++j) o[j] = y[(size_t)p * D + n + j];
+        for (int j = 0; j < 4; ++j) o[j] = 0.f;
     }
     part[k][lane] = make_float4(o[0], o[1], o[2], o[3]);
     __syncthreads();
@@ -722,7 +725,8 @@ __global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restr
 //
 // One thread per pick (two warps): pick i is a group leader if no earlier pick names its slot; its
 // group index is the number of leaders before it (two ballots), and it writes its own uid and
-// members.  Same output as the serial scan it replaced -- leaders in first-occurrence order,
+// members. A negative pick (DSV41_EXPERT_TOPP's pruned slot) leads no group and joins none, so
+// nothing of it is read.  Same output as the serial scan it replaced -- leaders in first-occurrence order,
 // members ascending -- which took 38-48 us a layer on the decode critical path (thread 0 alone,
 // a dependent global load per comparison); this takes a few.
 __global__ void __launch_bounds__(64) group_small_kernel(const int* __restrict__ pick, int* __restrict__ uids,
@@ -737,9 +741,9 @@ __global__ void __launch_bounds__(64) group_small_kernel(const int* __restrict__
     int e = 0;
     if (i < P) {
         e = sp[i];
-        lead = true;
-        for (int j = 0; j < i; ++j)
-            if (sp[j] == e) { lead = false; break; }
+        lead = e >= 0;
+        for (int j = 0; j < i && lead; ++j)
+            if (sp[j] == e) lead = false;
     }
     const unsigned b = __ballot_sync(0xffffffffu, lead);
     if (i == 0) lead0 = b;

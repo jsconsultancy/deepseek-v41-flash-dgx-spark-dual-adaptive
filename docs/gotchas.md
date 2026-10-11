@@ -2404,3 +2404,65 @@ the draft-vocab A/B read -0.02 +- 0.70 ms/step without a warm-up per run and -1.
 (per-prompt SD 3.3 -> 1.74 ms, penalty -0.23). `--warm-each` warms up on the prompt before every
 measured run; it doubles the decode time of a gate and roughly quarters the variance. A null result
 from this driver without it, at an expected effect near 1 ms, is not a measured null.
+
+## Skipping a missing expert costs more than substituting it (2026-10-11)
+
+The router masks non-resident experts before its top-k, so a missing pick becomes the next-ranked
+resident expert. Skipping that slot instead would save the substitute's expert read, so it was
+measured: teacher-forced NLL on `corpus/heldout_eval.jsonl` (109 sequences, 51,778 scored
+positions), serving's resident set frozen (fp4, 10,467 slots), four rules switched in one process
+(`Model._apply_miss_policy`, eval-only; `tools/bench_miss_policy_tp.py`). 11.0% of routed slots
+missed on this corpus. Difference from `substitute`, nats, SE clustered by sequence:
+
+| rule | coding | general | sequences worse |
+| --- | ---: | ---: | ---: |
+| substitute (serving) | 1.5132 | 2.1211 | -- |
+| skip, renormalize | **+0.0212 +- 0.0044** | **+0.0333 +- 0.0070** | 81 / 109 |
+| skip, unpruned weights | +0.0126 +- 0.0058 | **+0.0254 +- 0.0058** | 72 / 109 |
+| random resident, same weight | +0.0117 +- 0.0033 | **+0.0158 +- 0.0039** | 70 / 109 |
+
+Both skips fail the +0.015-nat budget on prose, and renormalizing is the worst rule. The substitute
+is not noise: a random resident expert in its slot, at the same weight, is 3.5-4 SE worse. But the
+random one still beats an empty slot on prose, so part of a substitute's value is only that the
+slot holds *an* expert output at that weight. Repeating `substitute` reproduced it bit for bit.
+
+Scale: prefill on this corpus misses 11%; decode on the code benchmark missed 3.2-3.9%, so the
+decode cost of skipping would be roughly a third of the table -- and so would its saving (~2-5%
+of expert reads, est. ~1 ms/step, needing a zero slot in TP mode). Not pursued.
+
+## Top-p expert pruning: 0.90 is free, TensorFold's production 0.85-renormalized is not (2026-10-11)
+
+TensorFold's lossy lever (`TF_DSV41_EXPERT_TOPP=0.85 MIN_K=3 RENORM=kept`, +5% decode there): per
+token and layer, keep the shortest prefix of the top-6 by weight share that reaches top-p (at least
+3) and drop the rest. Measured here before building it (`Model._apply_expert_topp`, eval-only;
+`tools/bench_miss_policy_tp.py`, same held-out NLL harness and frozen serving residency as the entry
+above, every scored position pruned):
+
+| rule | routed slots kept | coding | general | sequences worse |
+| --- | ---: | ---: | ---: | ---: |
+| unpruned (substitute) | 100% | 1.5068 | 2.1560 | -- |
+| top-p 0.90, router weights | 91.8% | -0.0020 +- 0.0018 | -0.0004 +- 0.0034 | 47 / 109 |
+| top-p 0.85, router weights | 80.9% | +0.0138 +- 0.0032 | +0.0106 +- 0.0047 | 73 / 109 |
+| **top-p 0.85, renormalized (TensorFold prod)** | 81.2% | **+0.0211 +- 0.0036** | **+0.0214 +- 0.0044** | 83 / 109 |
+
+0.90 drops 8% of picks with no measurable loss; 0.85 drops 19% inside the +0.015 budget (code at
++0.014 is close to it); renormalizing the survivors fails on both corpora. That is the third time
+today renormalization lost to keeping the router's own weights (skip vs skip_raw above; TensorFold's
+own docstring cites Training-Free Halving for the same) -- TensorFold chose `kept` on a speed number
+that bytes cannot explain, since both rules drop the same experts. Speed is not measured yet: the
+saving is in distinct experts a verify block reads, which falls less than the picks do.
+
+## At FP4's residency the French translation prompt fails, top-p or not (2026-10-11)
+
+`tools/bench_accept_ab_tp.py`'s prompt 18 ("Translate into French: The meeting has been moved to
+Thursday afternoon because of the holiday.") comes out mixed-language in every FP4 gate run on
+record -- "La réunionión a été verplaatst pentru a dilluns délután porque van de vakantie"
+(2026-10-08 base), "Le rendez-vous a été moved to Thursday afternoon..." (2026-10-11) -- and correct
+in both EXL3 arms of the same day ("La réunion a été déplacée à jeudi après-midi à cause du jour
+férié."). The gates run FP4 at ~62% residency and EXL3 at ~90%; the demand history is English- and
+code-heavy, so the experts French needs lose their slots and substitutes produce other languages
+(Japanese drifting into Chinese in serving is the same thing). Serving heals it: adaptation loads
+what such requests ask for, and the text improves as a conversation goes on. The gates freeze the
+map (`DSV41_PRUNE_SWAP=0`, decode adaptation off), so there it never heals and stays visible in
+every run -- which makes the prompt a useful canary for residency or ranking changes. Throughput
+gates do not notice (acceptance is fine); read the text.

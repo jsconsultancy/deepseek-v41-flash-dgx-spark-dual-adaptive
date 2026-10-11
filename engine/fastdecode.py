@@ -34,6 +34,7 @@ from engine import model as M
 from engine.model import HC_OPS as _HC_OPS, _hc_post_fused, _hc_pre_rn_fused
 from engine import comm as _comm
 from engine import l2pf
+from engine import expert_topp as _ETP
 import v41_ref as R
 
 try:
@@ -355,6 +356,12 @@ class FastDecoder:
         # turned into slots inside the graph and the whole layer is ONE graph (no host round-trip per layer)
         self.lut = None
         self.lut_version = -1
+        # DSV41_EXPERT_TOPP (engine/expert_topp.py): lossy decode pruning of low-share routed picks.
+        # When configured, the slot table gets a sentinel column (expert id n_routed_experts) that a
+        # dropped pick is rewritten to, so its weights are never read. `expert_topp` is the live rule
+        # (a benchmark may set it to None to compare); the column exists whenever it is configured.
+        self.expert_topp = _ETP.config()
+        self.topp_sentinel = self.a.n_routed_experts if self.expert_topp is not None else None
         self.stats = {"steps": 0, "graph_s": 0.0, "resolve_s": 0.0, "engram_s": 0.0, "draft_s": 0.0}
         # DSV41_GPU_TIMING=1: CUDA events around each phase of a step. Host timers cannot decompose
         # this path -- every one of them measures the host waiting for, or launching into, an async
@@ -933,6 +940,9 @@ class FastDecoder:
             self.rs_hits.index_fill_(0, idx.reshape(-1), 1)
             self.rs_uniq[L] += self.rs_hits.sum()
         self._tap('moe_in', L, y); self._tap('route_idx', L, idx); self._tap('topk', L, self.topk)
+        if self.expert_topp is not None:
+            # After the stats and taps (they describe the router), before any slot lookup.
+            _ETP.apply_(self.route_idx, self.route_w, *self.expert_topp, self.topp_sentinel)
 
     def _routed_experts(self):
         a = self.a
@@ -1367,6 +1377,16 @@ class FastDecoder:
         lut = torch.full((self.a.n_layers, self.a.n_routed_experts), fill, dtype=torch.int32)
         for (L, e), slot in st.lru.items():
             lut[L, e] = slot
+        if self.topp_sentinel is not None:
+            # The pruned-pick column: the FP4 kernels skip the null slot's pairs; the EXL3 decode
+            # grouping skips negative picks (reading the EXL3 null slot would cost a full read).
+            exl3 = getattr(self.eng, "kernel", None) == "exl3-cuda"
+            if getattr(self.eng, "expert_format", None) == "exl3" and not exl3:
+                raise ValueError("DSV41_EXPERT_TOPP on EXL3 experts needs the EXL3 CUDA decode kernel")
+            if not exl3 and null is None:
+                raise ValueError("DSV41_EXPERT_TOPP needs the null slot of the TP/EP expert store")
+            lut = torch.cat([lut, torch.full((self.a.n_layers, 1), -1 if exl3 else int(null),
+                                             dtype=torch.int32)], dim=1)
         # Validate ONCE, on the host tensor, before it goes to the device: a -1 left in the table
         # indexes the arena out of bounds inside a captured graph, where there is no bounds check
         # and the symptom would be corrupted experts rather than an error. Checking per call would
@@ -1380,9 +1400,11 @@ class FastDecoder:
         if pm:
             routable = torch.zeros_like(lut, dtype=torch.bool)
             for L, msk in pm.items():
-                routable[L] = msk.to(lut.device)
+                routable[L, :msk.numel()] = msk.to(lut.device)
         else:
             routable = torch.ones_like(lut, dtype=torch.bool)
+        if self.topp_sentinel is not None:
+            routable[:, self.topp_sentinel] = False   # never routed; it is where pruned picks go
         bad = int(((lut < 0) & routable).sum())
         assert bad == 0, (f"slot table leaves {bad} ROUTABLE (layer, expert) entries unmapped; "
                           f"every expert the router can pick needs a real slot or the null slot")
@@ -1622,8 +1644,16 @@ class FastDecoder:
     def _resolve(self, L):
         # host: expert ids -> arena slots (loads misses from NVMe)
         idx = self.route_idx
+        pruned = None
+        if self.topp_sentinel is not None:
+            # The store knows no sentinel: resolve the row's first pick (always kept) in its place
+            # and give the pruned pairs the null slot after (weight 0 either way).
+            pruned = idx == self.topp_sentinel
+            idx = torch.where(pruned, idx[:, :1], idx)
         try:
             slots = self.m.store.resolve(L, idx, L in self.stream_layers)
+            if pruned is not None and getattr(self.m.store, "null_slot", None) is not None:
+                slots = torch.where(pruned.to(slots.device), torch.full_like(slots, int(self.m.store.null_slot)), slots)
         except Exception:
             if L in self.stream_layers:
                 import traceback

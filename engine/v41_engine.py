@@ -27,6 +27,7 @@ from engine.model import MAX_CHUNK, PRUNE_MISS, Caches, Model, Weights  # noqa: 
 from engine import model as M_  # noqa: E402  (ATTN_TIMING phase table)
 from engine import fastdecode as _FD  # noqa: E402  (format flags pinned in the boot guard)
 from engine import draft_vocab as _DRAFT_VOCAB  # noqa: E402  (listed draft ids, boot guard)
+from engine import expert_topp as _ETP  # noqa: E402  (lossy decode pruning, boot guard)
 from engine.prefix_media import image_fingerprints, media_prefix
 from engine.prefix_persistence import PREFIX_DISK_MIN_INTERVAL_S
 import v41_ref as R  # noqa: E402
@@ -1389,6 +1390,10 @@ class V41Engine:
                 # in the log; the digest covers the file, the row count and the split.
                 "draft_vocab": getattr(self.W, "draft_vocab_digest", None),
                 "draft_vocab_version": _DRAFT_VOCAB.VERSION,
+                # Lossy decode pruning: a rank pruning differently computes a different routed sum
+                # and the pair diverges silently (engine/expert_topp.py).
+                "expert_topp": _ETP.config(),
+                "expert_topp_version": _ETP.VERSION,
                 "lookup_draft_enabled": LOOKUP_DRAFT_ENABLED,
                 "lookup_draft_ngram": LOOKUP_DRAFT_NGRAM,
                 "lookup_draft_candidates": LOOKUP_DRAFT_CANDIDATES,
@@ -3557,6 +3562,8 @@ class V41Engine:
             "draft_head_bytes": getattr(self.W, 'draft_head_bytes', 0),
             "draft_vocab": getattr(self.W, 'draft_vocab_digest', None),
             "draft_vocab_rows": (_DRAFT_VOCAB.rows() if getattr(self.W, 'draft_vocab_digest', None) else 0),
+            "expert_topp": (list(self.fast.expert_topp) if getattr(self, 'fast', None) is not None
+                            and self.fast.expert_topp is not None else None),
             "lookup_draft_enabled": LOOKUP_DRAFT_ENABLED,
             "lookup_draft_ngram": LOOKUP_DRAFT_NGRAM,
             "draft_bypass": self.draft_bypass_enabled,

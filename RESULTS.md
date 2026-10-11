@@ -3680,3 +3680,48 @@ Off by default. Artifacts: `results/draft-vocab-20261011/{ab-40960,ab-40960-warm
 trace-listed}/`. Tests: `engine/test_draft_vocab.py` (CPU; a two-thread simulated gather checks the
 split chain, the cross-rank tie rule, the logits scatter and the candidate ids against a reference;
 three of them fail when the id map is replaced by the plain head's).
+
+### 2026-10-11 — a missing expert: substitute (serving) vs skip vs random
+
+Teacher-forced held-out NLL, 109 sequences / 51,778 positions, frozen serving residency (fp4,
+10,467 slots), 11.0% of routed slots missed. vs `substitute` (coding 1.5132, general 2.1211):
+skip+renormalize +0.0212 +- 0.0044 / +0.0333 +- 0.0070; skip with unpruned weights +0.0126 +- 0.0058
+/ +0.0254 +- 0.0058; random resident at the substitute's weight +0.0117 +- 0.0033 / +0.0158 +- 0.0039.
+Rejected: skipping fails the +0.015 budget on prose. The next-ranked substitute beats a random one,
+so it is not noise. Details: docs/gotchas.md. Driver `tools/bench_miss_policy_tp.py`, eval-only
+switch `Model._apply_miss_policy` (serving never sets it), tests `engine/test_miss_policy.py`.
+Artifacts: `results/miss-policy-20261011/heldout/`.
+
+### 2026-10-11 — top-p routed-expert pruning, quality before building
+
+Held-out NLL, 109 sequences / 51,778 positions, frozen serving residency, pruning on every scored
+position. vs unpruned (coding 1.5068, general 2.1560): top-p 0.90 (router weights, min 3) keeps
+91.8% of routed slots, -0.0020 +- 0.0018 / -0.0004 +- 0.0034; top-p 0.85 keeps 80.9%, +0.0138 +-
+0.0032 / +0.0106 +- 0.0047; top-p 0.85 renormalized (TensorFold's production rule) keeps 81.2%,
++0.0211 +- 0.0036 / +0.0214 +- 0.0044 (fails +0.015). Repeat of the unpruned arm bit-identical.
+Artifacts: `results/miss-policy-20261011/topp/`. Decode speed not yet measured (needs the decode
+path to skip dropped experts' reads: the FP4 null slot, or the row's own top expert for EXL3).
+
+### 2026-10-11 — DSV41_EXPERT_TOPP=0.90 in decode: -2.2 ms/step (FP4), -1.9 ms/step (EXL3)
+
+Built (engine/expert_topp.py: one Triton launch a layer after the router; a pruned pick goes to a
+sentinel slot-table column -- the FP4 null slot, which the decode kernels skip, or -1 on EXL3,
+whose decode grouping now skips negative picks and whose combine adds 0 for them). Paired, one
+process per format, `tools/bench_accept_ab_tp.py --a topp_off --b topp90 --warm-each`, 24 prompts,
+frozen map, depth 3, EXL3 draft blocks on, loaded with DSV41_EXPERT_TOPP=0.90:
+
+| | ms/step | accepted tokens/step | tok/s | outputs identical |
+| --- | ---: | ---: | ---: | ---: |
+| FP4 | **-2.22 +- 0.22** (70.89 -> 68.67) | +0.032 +- 0.026 | **+1.65 +- 0.37** (+4.3%) | 1 / 24 |
+| EXL3 | **-1.91 +- 0.39** (62.74 -> 60.83) | +0.006 +- 0.025 | **+1.63 +- 0.53** (+3.6%) | 3 / 24 |
+
+Both ranks emitted the same tokens on every run (the driver asserts it per run). Outputs differ
+from the unpruned arm by greedy divergence -- a flipped near-tie, then an equally fluent
+continuation -- and held-out NLL does not move (entry above). The gates exited 1 after writing
+their results: the driver classified the arms as draft-only and asserted identical outputs;
+`expert_topp` is now a target key. Not yet checked: tool calls and structured output.
+
+Separately, both arms of the FP4 gate mistranslate the French prompt ("Le rendez-vous a été moved
+to Thursday afternoon...", "...verplaatst naar de namiddag..."), as every FP4 gate run since
+2026-10-08 did; both EXL3 arms translate it correctly. See docs/gotchas.md.
+Artifacts: `results/expert-topp-20261011/ab-{fp4,exl3}/`.

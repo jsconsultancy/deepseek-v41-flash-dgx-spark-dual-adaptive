@@ -46,6 +46,8 @@ PRUNE_MISS = _ADAPT.record
 # (engine/prune_miss_fused.py). Database-only: routing and tokens are unchanged either way.
 # Read at call time so the A/B bench can toggle it; the boot guard pins it.
 PRUNE_MISS_FUSED = os.environ.get("DSV41_PRUNE_MISS_FUSED", "1") == "1"
+from engine import expert_topp as _ETP_MOD  # noqa: E402
+_EXPERT_TOPP = _ETP_MOD.config()  # DSV41_EXPERT_TOPP: (topp, min_k) or None
 # How the demand database counts evidence. "slot" (default) adds one per (token, expert) routing
 # decision, so a request's vote is its token count: a 10k-token prompt outvotes a three-sentence
 # story in proportion to their lengths, and short benchmark probes are effectively invisible.
@@ -929,6 +931,67 @@ class Model:
         return keep.repeat_interleave(block_size, dim=-1)[..., :width]
 
     # ------------------------------------------------------------------ blocks
+    MISS_POLICIES = ("substitute", "skip", "skip_raw", "random")
+
+    def _apply_miss_policy(self, policy, unmasked, scores, indices, weights, keep, k):
+        """Eval-only (tools/bench_miss_policy_tp.py): what a routed pick the resident set lacks
+        becomes. Serving never sets `miss_policy`, so it keeps `substitute`: the masked top-k above,
+        where the next-ranked resident expert fills the slot with weight from its own score.
+
+        A slot is a substitute when the unmasked router did not choose that expert. Its expert id is
+        resident by construction, so every policy keeps the slot table valid and changes only an
+        identity (`random`) or a weight (`skip*`). Rows with no miss come out bit-identical:
+          skip      substitutes weigh 0; the resident picks renormalize to the full route scale
+          skip_raw  substitutes weigh 0; the resident picks keep the weights the unpruned router
+                    gives them, so the routed output is short by the missing experts' share
+          random    each substitute's expert becomes a random other resident one, same weight
+        """
+        if policy not in self.MISS_POLICIES:
+            raise ValueError(f"miss policy {policy!r}")
+        want = unmasked.topk(k, dim=-1)[1]
+        sub = ~(indices[:, :, None] == want[:, None, :]).any(-1)
+        stats = getattr(self, "miss_stats", None)
+        if stats is not None:  # device counters: substitute slots, all slots (no host sync)
+            stats[0] += sub.sum()
+            stats[1] += sub.numel()
+        if policy == "random":
+            r = torch.rand(unmasked.shape, generator=self.miss_gen, device=unmasked.device)
+            r = r.masked_fill(~keep, -1.0).scatter(1, indices, -1.0)
+            pick = r.topk(k, dim=-1)[1]  # k distinct residents a row, none already selected
+            nth = (sub.to(torch.int64).cumsum(-1) - 1).clamp(min=0)
+            return torch.where(sub, pick.gather(1, nth), indices), weights
+        kept = scores.gather(1, indices).masked_fill(sub, 0.0)
+        denom = (kept.sum(dim=-1, keepdim=True) if policy == "skip"
+                 else scores.gather(1, want).sum(dim=-1, keepdim=True))
+        return indices, kept / (denom + 1e-20) * self.args.route_scale
+
+    def _apply_expert_topp(self, rule, weights):
+        """Eval-only (tools/bench_miss_policy_tp.py `topp*` arms): TensorFold's lossy routed-expert
+        pruning (its families/deepseek_v41/cuda/prune.py). Per row, by weight share f descending (ties:
+        the lower slot), keep the shortest prefix whose mass before it is < `topp`, never fewer than
+        `min_k`; a dropped slot weighs 0 (its id stays, so the slot table is valid; a serving version
+        would also skip its read). `orig` keeps the kept weights as the router gave them, so the
+        routed output shrinks by the dropped share; `kept` renormalizes them to the route scale.
+        Rows that keep every slot are bit-identical."""
+        topp, min_k, renorm = rule
+        f = weights / weights.sum(dim=-1, keepdim=True)
+        order = torch.argsort(-f, dim=-1, stable=True)
+        fs = f.gather(1, order)
+        keep_sorted = (fs.cumsum(dim=-1) - fs) < topp
+        keep_sorted[:, :min_k] = True
+        keep = torch.zeros_like(keep_sorted).scatter(1, order, keep_sorted)
+        stats = getattr(self, "topp_stats", None)
+        if stats is not None:  # device counters: kept slots, all slots
+            stats[0] += keep.sum()
+            stats[1] += keep.numel()
+        nw = torch.where(keep, weights, torch.zeros_like(weights))
+        if renorm == "kept":
+            nw = torch.where(keep.all(dim=-1, keepdim=True), weights,
+                             nw / (nw.sum(dim=-1, keepdim=True) + 1e-20) * self.args.route_scale)
+        else:
+            nw = torch.where(keep.all(dim=-1, keepdim=True), weights, nw)
+        return nw
+
     def _record_prune_miss(self, logits, scores, keep_mask, L: int, k: int, decode: bool = False):
         """Record what the router WANTED, per (layer, expert) -- reachable or not.
 
@@ -1184,6 +1247,7 @@ class Model:
                 self._record_prune_miss(logits, scores,
                                         pm[L] if focus_rows is not None else effective_keep, L, k)
             # expert pruning experiment: the router may only pick surviving experts (REAP-style drop)
+            unmasked = logits
             logits = logits.masked_fill(~effective_keep, float("-inf"))
         indices = logits.topk(k, dim=-1)[1]
         probe = getattr(self, "prefill_replica_counts", None)
@@ -1192,6 +1256,18 @@ class Model:
             probe[L].scatter_add_(0, flat, torch.ones_like(flat, dtype=torch.int32))
         weights = scores.gather(1, indices)
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20) * a.route_scale
+        policy = getattr(self, "miss_policy", "substitute")
+        if (policy != "substitute" and pm is not None and n_experts != 128 and L in pm
+                and not streaming and not rescued):
+            indices, weights = self._apply_miss_policy(policy, unmasked, scores, indices, weights,
+                                                       effective_keep, k)
+        topp = getattr(self, "expert_topp", None)  # eval-only rule, any phase (bench_miss_policy_tp)
+        if topp is None and not prefill and _EXPERT_TOPP is not None:
+            # DSV41_EXPERT_TOPP on the eager decode path: the graphed path (FastDecoder) also skips
+            # the dropped experts' reads; here they compute with weight 0, which adds exact zeros.
+            topp = (_EXPERT_TOPP[0], _EXPERT_TOPP[1], "orig")
+        if topp is not None and n_experts != 128 and not streaming and not rescued:
+            weights = self._apply_expert_topp(topp, weights)
         if focus_rows is not None:
             focus.record(L, indices, weights / a.route_scale, focus_rows)
         self._tap("route_idx", L, indices); self._tap("route_w", L, weights)
