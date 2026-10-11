@@ -26,6 +26,7 @@ from engine.engram import EngramReadAhead, EngramTable, make_hash_state, prefetc
 from engine.model import MAX_CHUNK, PRUNE_MISS, Caches, Model, Weights  # noqa: E402
 from engine import model as M_  # noqa: E402  (ATTN_TIMING phase table)
 from engine import fastdecode as _FD  # noqa: E402  (format flags pinned in the boot guard)
+from engine import draft_vocab as _DRAFT_VOCAB  # noqa: E402  (listed draft ids, boot guard)
 from engine.prefix_media import image_fingerprints, media_prefix
 from engine.prefix_persistence import PREFIX_DISK_MIN_INTERVAL_S
 import v41_ref as R  # noqa: E402
@@ -1384,6 +1385,10 @@ class V41Engine:
                 "markov_head_fmt": _FD.MARKOV_HEAD_FMT,
                 "tp_draft_head": tp_draft_head_enabled(),
                 "tp_draft_head_version": TP_DRAFT_HEAD_VERSION,
+                # A rank drafting from a different id list proposes different tokens with nothing
+                # in the log; the digest covers the file, the row count and the split.
+                "draft_vocab": getattr(self.W, "draft_vocab_digest", None),
+                "draft_vocab_version": _DRAFT_VOCAB.VERSION,
                 "lookup_draft_enabled": LOOKUP_DRAFT_ENABLED,
                 "lookup_draft_ngram": LOOKUP_DRAFT_NGRAM,
                 "lookup_draft_candidates": LOOKUP_DRAFT_CANDIDATES,
@@ -3550,6 +3555,8 @@ class V41Engine:
             "markov_head_fmt": _FD.MARKOV_HEAD_FMT,
             "tp_draft_head": os.environ.get('DSV41_TP_DRAFT_HEAD', '0') == '1',
             "draft_head_bytes": getattr(self.W, 'draft_head_bytes', 0),
+            "draft_vocab": getattr(self.W, 'draft_vocab_digest', None),
+            "draft_vocab_rows": (_DRAFT_VOCAB.rows() if getattr(self.W, 'draft_vocab_digest', None) else 0),
             "lookup_draft_enabled": LOOKUP_DRAFT_ENABLED,
             "lookup_draft_ngram": LOOKUP_DRAFT_NGRAM,
             "draft_bypass": self.draft_bypass_enabled,

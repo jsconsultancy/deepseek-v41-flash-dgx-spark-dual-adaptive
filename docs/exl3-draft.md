@@ -99,6 +99,17 @@ kernel. **Draft bytes are not the lever any more; the heads are at the memory ce
 launch count.** The next step for the draft is fusing its elementwise/mHC/norm chain (335 kernel
 nodes a pass against TensorFold's 147), not a smaller format.
 
+**Follow-up, same day: fewer rows did what a smaller format did not.** The fp4 arm above changed
+the kernel along with the bytes. Keeping the fp8 and cuBLAS kernels and reading fewer *rows* --
+the heads over a listed vocabulary of 40,960 ids a rank (`DSV41_DRAFT_VOCAB`, docs/draft-vocab.md)
+-- took the draft head 1.54 -> 0.94 ms and the Markov GEMVs 0.80 -> 0.27 ms a pass (more than the
+rows alone, consistent with 21 MB of listed Markov rows fitting the L2 that the 33 MB half could
+not), and the step **-1.06 +- 0.37 ms**,
+acceptance -0.0013 +- 0.0013. "At the memory ceiling" was right about the format; it was not the
+end of the bytes lever. Separately, the +0.29 +- 1.03 above carries the A/B driver's first-run
+penalty (docs/gotchas.md, 2026-10-11); it is unbiased but its error bar is roughly twice what
+`--warm-each` gives.
+
 ## Where the remaining gap is
 
 TensorFold's draft graph is 3.716 ms for the same three blocks (its `docs/DECODE.md` §2; measured

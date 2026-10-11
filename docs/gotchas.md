@@ -2363,3 +2363,44 @@ scripts/dual-dev.sh` booted the `.env`'s FP4 at 98.4 GB, healthy and silent. Var
 not set (an experiment switch) pass through, which is why it went unnoticed. Until it is fixed,
 sync engine/tools/server to the peer and call `DSV41_DEV_SOURCE=1 scripts/dual-up.sh` directly, and
 check `/health` `engine_config` before benchmarking a profile.
+
+## Draft heads: fewer rows worked where a smaller format did not (2026-10-11)
+
+Follow-up to the entry above. The fp4 arm changed the kernel together with the bytes. Reading
+fewer *rows* through the same fp8 and cuBLAS kernels -- the drafter's heads over 40,960 listed ids a
+rank instead of all 64,640 (`DSV41_DRAFT_VOCAB`, docs/draft-vocab.md) -- took the draft graph 6.07 ->
+4.58 ms a pass and the step **-1.06 +- 0.37 ms** (+0.56 +- 0.22 tok/s), acceptance -0.0013 +- 0.0013,
+24/24 outputs identical. The Markov GEMVs fell more than their rows (0.80 -> 0.27 ms for 0.63x the
+rows), consistent with the 21 MB of listed rows staying in L2 across the five back-to-back reads.
+
+Three things that went wrong on the way and will go wrong again:
+
+* **Per-half quotas waste rank 1.** The common tokens of this tokenizer sit mostly below id 64,640;
+  an equal list per vocabulary half missed 2.13% of held-out English against 1.17% for the same
+  number of ids chosen globally. The list is split into contiguous runs instead, which also keeps
+  the lower-id tie rule.
+* **Low ids are not common ids here.** Ordering by id covered 87.5% of held-out English docs at
+  24,576 a rank, against 99.5% ordered by corpus counts. Do not fill a short list from the lowest ids.
+* **The A/B prompts' replies are all over results/.** `prefill-trace-20261008` held 35 of 42,
+  `exl3-tune-20261008` 8, each generation gate one. A ranking that included them reported 0.59%
+  unlisted at 32,768 a rank; the honest figure is 1.46%. `tools/build_draft_vocab.py
+  --exclude-replies-of` exists for this.
+
+## The A/B driver's first run of each prompt is ~1.5 ms/step slow (2026-10-11)
+
+`tools/bench_accept_ab_tp.py` warms up only when the arm changes. With per-prompt alternating order
+the arm never changes between prompt i's second run and prompt i+1's first, so the first run of
+every prompt captures that prompt's graph variants (parities, index buckets) inside its measured
+window. Splitting each A/B's paired deltas by which arm ran first:
+
+| A/B | first-run penalty | arm effect, order removed |
+| --- | ---: | ---: |
+| `exl3-draft-ab/ab` (x3d_off -> x3d_on) | +1.64 ms | -0.82 ms |
+| `head-fp8/ab` (h_packed -> h_fp8) | +1.05 ms | +1.99 ms |
+| `draft-vocab-20261011/ab-40960` (vocab_full -> vocab_listed) | +1.62 ms | +0.06 ms |
+
+Alternation cancels it in the mean, so past results are unbiased, but it dominates the error bar:
+the draft-vocab A/B read -0.02 +- 0.70 ms/step without a warm-up per run and -1.06 +- 0.37 with one
+(per-prompt SD 3.3 -> 1.74 ms, penalty -0.23). `--warm-each` warms up on the prompt before every
+measured run; it doubles the decode time of a gate and roughly quarters the variance. A null result
+from this driver without it, at an expected effect near 1 ms, is not a measured null.

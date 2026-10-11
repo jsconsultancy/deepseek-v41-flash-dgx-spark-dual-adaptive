@@ -292,6 +292,8 @@ class Weights:
         # decode step, so its stored format is worth as much as a dense projection group's.
         head = get('head.weight')
         from engine.tensor_parallel import draft_head_bytes, make_tp_draft_head
+        from engine import draft_vocab
+        self.draft_vocab_digest = None
         if os.environ.get('DSV41_TP_HEAD', '0') == '1':
             from engine.tensor_parallel import VocabParallelHead
             rank, world = int(os.environ.get('RANK', '0')), int(os.environ.get('WORLD_SIZE', '1'))
@@ -299,7 +301,21 @@ class Weights:
                 raise ValueError('vocabulary TP requires two equal shards')
             shard = head.chunk(world, dim=0)[rank].to(device)
             self.head = VocabParallelHead(R.make_head(shard), world)
-            self.draft_head = make_tp_draft_head(self.head, load_mtp=load_mtp, source=shard)
+            # DSV41_DRAFT_VOCAB (engine/draft_vocab.py): the drafter's head over listed ids only,
+            # built from the full head.weight because a rank's run of listed ids is not its
+            # verifier half. DSV41_BENCH_DRAFT_VOCAB_AB=1 also keeps the full-vocabulary draft head
+            # (`draft_head_full`) so a driver can A/B the two in one process; never set in serving.
+            listed = draft_vocab.load(head.shape[0], world) if load_mtp else None
+            if listed is not None:
+                from engine.tensor_parallel import make_listed_draft_head, tp_draft_head_enabled
+                if not tp_draft_head_enabled():
+                    raise ValueError('DSV41_DRAFT_VOCAB needs DSV41_TP_DRAFT_HEAD=1')
+                self.draft_vocab_digest = draft_vocab.digest(listed)
+                self.draft_head = make_listed_draft_head(head, listed, rank, world, device)
+                if os.environ.get('DSV41_BENCH_DRAFT_VOCAB_AB', '0') == '1':
+                    self.draft_head_full = make_tp_draft_head(self.head, load_mtp=load_mtp, source=shard)
+            else:
+                self.draft_head = make_tp_draft_head(self.head, load_mtp=load_mtp, source=shard)
             # Benchmark-only (DSV41_BENCH_DRAFT_HEAD_SRC): keep this rank's bf16 vocabulary shard so
             # a driver can rebuild the draft head in another format and A/B the two inside one
             # process. The head format is a load-time choice otherwise, and comparing two of them
@@ -309,6 +325,8 @@ class Weights:
                 self.draft_head_src = shard.clone()
             del shard
         else:
+            if draft_vocab.enabled():
+                raise ValueError('DSV41_DRAFT_VOCAB needs the TP vocabulary head (DSV41_TP_HEAD=1)')
             self.head = R.make_head(head.to(device))
             # DSV41_DRAFT_HEAD_FMT: the verifier keeps `head`; only the drafter reads the cheaper
             # copy. None means "reuse the verifier's" (off, already quantized, or FP32 reference).

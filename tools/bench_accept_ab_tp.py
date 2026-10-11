@@ -83,6 +83,12 @@ CONFIGS['heads_fp8_mk4'] = dict(CONFIGS['x3d_on'], draft_head_fmt='fp8', markov_
 # differ, which is why `head_fmt` is in target_keys below.
 CONFIGS['h_packed'] = dict(CONFIGS['x3d_on'], head_fmt='packed', draft_head='fp8')
 CONFIGS['h_fp8'] = dict(CONFIGS['x3d_on'], head_fmt='fp8', draft_head='fp8')
+# The drafter's two heads over a listed vocabulary (engine/draft_vocab.py). Load with
+# DSV41_DRAFT_VOCAB=<ranking> DSV41_BENCH_DRAFT_VOCAB_AB=1 (and DSV41_EXL3_DRAFT_DENSE=1, which
+# x3d_on reads) so the listed and the full-vocabulary fp8 draft heads are both resident. Draft-only:
+# greedy outputs must stay bit-identical; the acceptance delta is the unlisted tokens' cost.
+CONFIGS['vocab_full'] = dict(CONFIGS['x3d_on'], draft_vocab=False)
+CONFIGS['vocab_listed'] = dict(CONFIGS['x3d_on'], draft_vocab=True)
 for _qkv, _sh, _attn in ((24, 16, 4), (24, 16, 12), (12, 0, 4), (24, 0, 4), (0, 16, 4)):
     CONFIGS[f'cand_q{_qkv}_s{_sh}_a{_attn}'] = dict(CONFIGS['draft_fp8_split'], qkv_mb=_qkv, sh_mb=_sh, attn_mb=_attn)
 
@@ -187,6 +193,12 @@ def set_config(e, cfg):
             from engine.tensor_parallel import VocabParallelHead
             bank[fmt] = VocabParallelHead(v41_ref._head_in_format(src, fmt), e.W.head.world)
         fd.draft_head = bank[fmt]
+    if 'draft_vocab' in cfg:
+        full = getattr(e.W, 'draft_head_full', None)
+        assert full is not None and e.W.draft_vocab_digest is not None, \
+            'load with DSV41_DRAFT_VOCAB=<ranking> DSV41_BENCH_DRAFT_VOCAB_AB=1'
+        fd.draft_head = e.W.draft_head if cfg['draft_vocab'] else full
+        fd.set_markov_fmt(fd.markov_fmt)  # the split chain's Markov rows follow the head's ids
     if 'markov_fmt' in cfg:
         fd.set_markov_fmt(cfg['markov_fmt'])
     if 'early_draft' in cfg:
@@ -208,6 +220,12 @@ def main():
     ap.add_argument('--b', default='all')
     ap.add_argument('--max-tokens', type=int, default=160)
     ap.add_argument('--prompts', type=int, default=len(PROMPTS))
+    # The default warms up only when the arm changes, so with alternating order the first run of
+    # every prompt captures that prompt's graph variants inside its measured window: +1.0 to +1.6
+    # ms/step on whichever arm ran first, in every A/B of 2026-10-11 (exl3-draft-ab, head-fp8,
+    # draft-vocab). Alternation keeps the mean unbiased but that term dominates the error bar.
+    ap.add_argument('--warm-each', action='store_true',
+                    help='warm up on the prompt before every measured run, not only on a switch')
     args = ap.parse_args()
     assert args.a in CONFIGS and args.b in CONFIGS and 1 <= args.prompts <= len(PROMPTS)
     V.save_prune_db = lambda *a, **kw: None
@@ -233,10 +251,12 @@ def main():
     current = [None]
 
     def run(i, arm, measured=True):
-        if current[0] != arm:
+        switched = current[0] != arm
+        if switched:
             set_config(e, CONFIGS[arm])
             assert len(set(e.ep.gather_objects(arm))) == 1, 'arm differs between ranks'
             current[0] = arm
+        if switched or (measured and args.warm_each):
             # Capture every graph this prompt needs (parities, index buckets) outside the
             # measurement: a 24-token warmup on another prompt left the first measured run after
             # each switch ~1.9 ms/step slower (results/accept-ab-20261008/all-vs-mk128).

@@ -829,7 +829,15 @@ class FastDecoder:
         self.markov_fmt = fmt
         src = self.W.mtp[2].markov_head
         self.markov_head_bf16 = src if fmt in ('off', 'bf16') else R._head_in_format(src, fmt)
-        if self.markov_head_local is not None or hasattr(self.draft_head, 'world'):
+        listed = getattr(self.draft_head, 'ids_local', None)
+        if listed is not None:
+            # DSV41_DRAFT_VOCAB: the split chain scores the listed head's own columns, so its Markov
+            # rows are those ids, gathered once into contiguous storage (21 MB of bf16 at 40,960 a
+            # rank, under the 24 MiB L2 -- whether the five back-to-back reads then hit it is a
+            # trace question, not an assumption).
+            local = src.index_select(0, listed.to(torch.int64))
+            self.markov_head_local = local if fmt in ('off', 'bf16') else R._head_in_format(local, fmt)
+        elif self.markov_head_local is not None or hasattr(self.draft_head, 'world'):
             rows = self.draft_head.local.shape[0]
             # off/bf16 keep the strided row view the drafter always passed cuBLAS; only a quantized
             # copy needs its own contiguous storage.

@@ -3645,3 +3645,38 @@ The first attempt is kept as `fp4-984-userenv*` and is not a README number: `scr
 sourced `.env` over the caller's `EXPERT_FORMAT=exl3 ARENA_GB=92.3 MAX_SEQ=524288`, so "exl3" booted
 FP4 at 98.4 GB (docs/gotchas.md). The rerun synced the source itself and called `dual-up.sh` with
 `DSV41_DEV_SOURCE=1`, and checked `/health` before measuring.
+
+### 2026-10-11 — the drafter's heads over a listed vocabulary: -1.06 ms/step
+
+`DSV41_DRAFT_VOCAB` (docs/draft-vocab.md) scores the draft over 40,960 listed ids a rank instead of
+the 64,640 of each vocabulary half: the fp8 draft head reads 210 MB instead of 331, and the split
+Markov chain's five GEMVs read 21 MB instead of 33. The verifier's head is untouched.
+
+| | full vocabulary | 40,960 listed | delta |
+| --- | ---: | ---: | ---: |
+| draft graph span, ms a pass (rank-0 trace, 12 passes) | 6.07 | 4.58 | -1.49 |
+| fp8 draft head, ms a pass | 1.54 | 0.94 | -0.59 |
+| Markov bias GEMVs, ms a pass | 0.80 | 0.27 | -0.53 |
+| ms/step (paired, 24 prompts, `--warm-each`) | 70.58 | 69.52 | **-1.06 +- 0.37** |
+| accepted tokens/step | 2.6952 | 2.6939 | -0.0013 +- 0.0013 |
+| tok/s | | | **+0.56 +- 0.22** |
+| greedy outputs | | | 24 / 24 identical |
+
+Same gate settings as the 2026-10-11 EXL3 draft A/B (frozen map, depth 3, adaptation off,
+`DSV41_EXL3_DRAFT_DENSE=1`), one process loaded with `DSV41_BENCH_DRAFT_VOCAB_AB=1` so both draft
+heads are resident and the arms switch at runtime. The list is `engine/draft_vocab_ranking_v1.txt`
+(built from UltraChat, WikiText-103, code and multilingual docs; every reply to an A/B prompt
+removed): 0.28% of the A/B replies' tokens are unlisted at 40,960 a rank, 1.46% at 32,768.
+
+The first run of this A/B without `--warm-each` read -0.02 +- 0.70 ms/step. That is the driver's
+first-run penalty (+1.62 ms on whichever arm ran first on a prompt; docs/gotchas.md), not a null:
+order removed it gives +0.06 with an error bar that cannot see 1 ms. The same penalty is in the
+EXL3 draft and head-fp8 A/Bs of the same day (+1.64 and +1.05 ms).
+
+A one-GPU microbenchmark (real `head.weight`, L2 flushed before each call) predicted the head part:
+1.575 -> 1.030 ms for the draft head, 0.76 -> 0.27 ms for the five Markov GEMVs.
+
+Off by default. Artifacts: `results/draft-vocab-20261011/{ab-40960,ab-40960-warm,trace-full,
+trace-listed}/`. Tests: `engine/test_draft_vocab.py` (CPU; a two-thread simulated gather checks the
+split chain, the cross-rank tie rule, the logits scatter and the candidate ids against a reference;
+three of them fail when the id map is replaced by the plain head's).

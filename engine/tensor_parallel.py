@@ -213,7 +213,6 @@ class VocabParallelHead:
         as a full-vocabulary argmax does. Returns (proposals [T] int64, previous-token embeddings)."""
         import v41_ref as R
         local = R.head_logits(x, self.local).reshape(-1, self.local.shape[0])
-        offset = rank * self.local.shape[0]
         prev = anchor.reshape(1)
         proposals, embeddings = [], []
         for i in range(local.shape[0]):
@@ -222,7 +221,7 @@ class VocabParallelHead:
             lg = local[i] + linear(e, head_local).float()[0]
             best = lg.argmax().view(1)
             packed = torch.cat([lg.gather(0, best),
-                                (best.to(torch.int32) + offset).view(torch.float32)]).contiguous()
+                                self._column_id(best, rank).view(torch.float32)]).contiguous()
             gathered = torch.empty(self.world * 2, dtype=torch.float32, device=lg.device)
             comm.all_gather_fast(gathered, packed, group=collective_group())
             pairs = gathered.view(self.world, 2)
@@ -244,10 +243,74 @@ class VocabParallelHead:
         gathered = torch.empty((self.world * rows, 2 * k_local), dtype=torch.float32, device=local.device)
         comm.all_gather_fast(gathered, packed, group=collective_group())
         g = gathered.view(self.world, rows, 2 * k_local)
-        offset = (torch.arange(self.world, device=local.device, dtype=torch.int64)
-                  * self.local.shape[0]).view(self.world, 1, 1)
-        gids = g[..., k_local:].contiguous().view(torch.int32).to(torch.int64) + offset
+        gids = self._gathered_ids(g[..., k_local:].contiguous().view(torch.int32).to(torch.int64))
         gids = gids.permute(1, 0, 2).reshape(rows, self.world * k_local)
         gvals = g[..., :k_local].permute(1, 0, 2).reshape(rows, self.world * k_local)
         gids, order = gids.sort(dim=-1)
         return gids, gvals.gather(1, order)
+
+    def _column_id(self, col, rank):
+        """Global token id (int32) of this rank's head column `col` (int64 [1])."""
+        return col.to(torch.int32) + rank * self.local.shape[0]
+
+    def _gathered_ids(self, cols):
+        """Global token ids (int64) of gathered columns `cols` [world, rows, k], rank-major."""
+        offset = (torch.arange(self.world, device=cols.device, dtype=torch.int64)
+                  * self.local.shape[0]).view(self.world, 1, 1)
+        return cols + offset
+
+
+class ListedVocabHead(VocabParallelHead):
+    """The drafter's vocabulary head over listed ids (engine/draft_vocab.py), one contiguous run of
+    them a rank. Draft-only: the verifier keeps its own VocabParallelHead over the full vocabulary.
+
+    `local` holds this rank's listed rows of `head.weight` in column order (ascending ids);
+    `ids_all` is every rank's list, so each rank maps any gathered column to its token id. The
+    greedy chain and the candidate exchange are the base class's with that mapping; `tp_logits`
+    scatters the gathered listed logits into a full-vocabulary row of -inf, so the sampling draft,
+    the global shortlist and the tree probe read the same [T, V] shape as before and an unlisted
+    token gets probability zero (rejection sampling stays exact: the residual can still emit it)."""
+
+    def __init__(self, local, world, ids_all, vocab, rank):
+        super().__init__(local, world)
+        if ids_all.numel() != world * local.shape[0]:
+            raise ValueError('listed vocabulary: one run of local.shape[0] ids a rank')
+        self.vocab, self.rank = vocab, rank
+        self.shape = (vocab, local.shape[1])
+        self.ids_all = ids_all.to(torch.int64)
+        self.ids_by_rank = self.ids_all.view(world, local.shape[0])
+        self.ids_local = self.ids_by_rank[rank].to(torch.int32).contiguous()
+
+    def tp_logits(self, x):
+        import v41_ref as R
+        local = R.head_logits(x, self.local).contiguous()
+        flat = local.reshape(-1, local.shape[-1])
+        rows, n = flat.shape
+        gathered = torch.empty((self.world * rows, n), dtype=flat.dtype, device=flat.device)
+        comm.all_gather_fast(gathered, flat, group=collective_group())
+        listed = gathered.view(self.world, rows, n).transpose(0, 1).reshape(rows, self.world * n)
+        out = torch.full((rows, self.vocab), float('-inf'), dtype=listed.dtype, device=listed.device)
+        out.index_copy_(1, self.ids_all, listed)
+        return out.reshape(*x.shape[:-1], self.vocab)
+
+    def _column_id(self, col, rank):
+        return self.ids_local.gather(0, col)
+
+    def _gathered_ids(self, cols):
+        w, rows, k = cols.shape
+        return self.ids_by_rank.gather(1, cols.reshape(w, rows * k)).reshape(w, rows, k)
+
+
+def make_listed_draft_head(head, ids_all, rank, world, device):
+    """The draft's ListedVocabHead from the full bf16 `head.weight` (every rank loads it before
+    taking its verifier shard), in DSV41_DRAFT_HEAD_FMT. No collective runs here."""
+    import v41_ref as R
+    from engine import draft_vocab
+    fmt = R.draft_head_fmt()
+    if fmt not in ('fp8', 'fp4', 'bf16'):
+        raise ValueError('DSV41_DRAFT_VOCAB builds its own head: set DSV41_DRAFT_HEAD_FMT to fp8, fp4 or bf16')
+    mine = draft_vocab.rank_ids(ids_all, rank, world)
+    rows = head.index_select(0, mine.to(head.device)).to(device)
+    local = R._head_in_format(rows, fmt)
+    del rows
+    return ListedVocabHead(local, world, ids_all.to(device), head.shape[0], rank)
