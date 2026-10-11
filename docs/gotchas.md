@@ -2353,3 +2353,13 @@ its elementwise/mHC/norm chain, not a format change. (For scale: the *verifier's
 lever entirely — `HEAD_FMT=fp8` was measured at 2.96 ms against bf16's 5.68 ms for +0.0004 nats, and
 the profile currently runs lossless `HEAD_KERNEL=packed` instead. That is a quality decision, and it
 is four times the draft's remaining gap.)
+
+## `dual-dev.sh` overrides the caller's settings with `.env` (2026-10-11)
+
+`scripts/dual-up.sh` keeps a caller's `EXPERT_FORMAT=... ARENA_GB=... scripts/dual-up.sh` over
+`.env`. `scripts/dual-dev.sh` sources `.env` itself before exec'ing `dual-up.sh`, so the caller's
+value is already gone by the time `dual-up.sh` captures it: `EXPERT_FORMAT=exl3 ARENA_GB=92.3
+scripts/dual-dev.sh` booted the `.env`'s FP4 at 98.4 GB, healthy and silent. Variables `.env` does
+not set (an experiment switch) pass through, which is why it went unnoticed. Until it is fixed,
+sync engine/tools/server to the peer and call `DSV41_DEV_SOURCE=1 scripts/dual-up.sh` directly, and
+check `/health` `engine_config` before benchmarking a profile.

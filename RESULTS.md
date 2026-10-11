@@ -3620,3 +3620,28 @@ on both nodes at `~/models/exl3-packs/exl3-draft-r{0,1}of2.safetensors`
 (`source 464d2dc4d3edbc48`). `scripts/exl3-packs.sh` now builds them alongside the expert packs. The
 default FP8 path is unchanged: `set_markov_fmt('off')` returns the same tensor and the same row view
 the drafter passed cuBLAS before.
+
+### 2026-10-11 — README numbers with the EXL3 draft blocks on by default
+
+The 2026-10-08 protocol unchanged (`results/readme-20261011/run.py` = the 2026-10-08 driver:
+3 workloads, warmup + 2 x 512 tokens, temperature 0; cold prefill 8K x5, 32K x2), main checkout
+booted with the dev source mounts, `ARENA_GB=92.3`, `MAX_SEQ=524288`, `DSV41_EXL3_DRAFT_DENSE=1`.
+
+| | FP4 | EXL3 |
+| --- | ---: | ---: |
+| Residents | 9,793 (63.8%) | 13,813 (89.9%) |
+| Essay / HTML / Python decode, tok/s | 28.5 / 55.2 / 40.7 | 31.6 / 62.8 / 46.8 |
+| 8K prefill, median (runs) | 7.84 s (10.29, 8.94, 6.51, 6.64, 7.84) | 6.81 s (7.81, 6.81, 7.23, 6.03, 6.08) |
+| 32K prefill | 26.07 s (25.24, 26.90) | 22.57 s (22.57, 22.56) |
+
+EXL3 decode is level with 2026-10-08 (31.0 / 64.4 / 46.7) within these two-run medians; the
+drafter's own effect is the paired -1.05 +- 0.37 ms/step, below this benchmark's resolution. FP4's
++3-12% is mostly not the drafter: the 2026-10-08 FP4 run followed a profile switch and two of its
+requests queued behind re-planning. Prefill and first-token times are slower than 2026-10-08 (8K
+5.7 -> 6.8 s EXL3); the drafter does not run in prefill. Probe prefill (`DSV41_PROBE_PREFILL=1`, on
+since 8dc80f7) adds discovery and loading before prefill and is the likely cause; not investigated.
+
+The first attempt is kept as `fp4-984-userenv*` and is not a README number: `scripts/dual-dev.sh`
+sourced `.env` over the caller's `EXPERT_FORMAT=exl3 ARENA_GB=92.3 MAX_SEQ=524288`, so "exl3" booted
+FP4 at 98.4 GB (docs/gotchas.md). The rerun synced the source itself and called `dual-up.sh` with
+`DSV41_DEV_SOURCE=1`, and checked `/health` before measuring.

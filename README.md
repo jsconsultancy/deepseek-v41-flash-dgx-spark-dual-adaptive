@@ -13,10 +13,10 @@ OpenAI-compatible API supports streaming responses, thinking, tool calls and ima
 The engine began as [0xBakeer's single-Spark engine](https://github.com/0xBakeer/deepseek-v41-flash-spark);
 see [lineage](#lineage-and-credits) for what is inherited and what changed.
 
-| Default EXL3 profile, 2026-10-08 | |
+| Default EXL3 profile, 2026-10-11 | |
 | --- | --- |
-| Decode, essay / HTML game / Python | **31.0 / 64.4 / 46.7 tok/s** (FP4: 25.6 / 49.3 / 39.4) |
-| Cold prefill, 8K / 32K | **1,445 / 1,394 tok/s** (FP4: 1,332 / 1,441) |
+| Decode, essay / HTML game / Python | **31.6 / 62.8 / 46.8 tok/s** (FP4: 28.5 / 55.2 / 40.7) |
+| Cold prefill, 8K / 32K | **1,203 / 1,452 tok/s** (FP4: 1,045 / 1,257) |
 | Resident routed experts at 92.3 GB/node | **13,813 of 15,360 (90%)** (FP4: 9,793, 64%) |
 
 At the default arena not every routed expert is resident; residency follows demand and is
@@ -58,51 +58,53 @@ combination with a persistent, observable, globally adaptive expert working set.
 
 ## EXL3 (default) or FP4 experts
 
-Both profiles serve the same model: dense layers, attention, the vocabulary head, Engram,
-shared experts and the DSpark drafter always come from the native checkpoint. Only the
-384 x 40 routed experts differ.
+Both profiles serve the same model: dense layers, attention, the vocabulary head, Engram and
+shared experts always come from the native checkpoint. Only the 384 x 40 routed experts
+differ. In both profiles the DSpark drafter's three blocks read a 4-bit EXL3 draft pack by
+default (`DSV41_EXL3_DRAFT_DENSE=1`); the drafter only proposes and the target verifies, so
+this changes speed, not output.
 
 | At `ARENA_GB=92.3` per node | **EXL3** (`.env.example.exl3`, default) | FP4 (`.env.example.fp4`) |
 | --- | --- | --- |
 | Routed expert weights | [Mia-AiLab's](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw) EXL3, 2.9 bpw average (2-bit in layers 18-22), 6.67 MB/node each | Checkpoint MXFP4, 9.4 MB/node each |
 | Resident experts | **13,813 (90%)** | 9,793 (64%) |
-| Decode, essay / HTML / Python | **31.0 / 64.4 / 46.7 tok/s** | 25.6 / 49.3 / 39.4 tok/s |
-| Cold prefill, 8K / 32K | 1,445 / 1,394 tok/s | 1,332 / 1,441 tok/s (parity within noise) |
-| Extra disk | 98 GB pack per node, built once from the 198 GB EXL3 checkpoint | none |
+| Decode, essay / HTML / Python | **31.6 / 62.8 / 46.8 tok/s** | 28.5 / 55.2 / 40.7 tok/s |
+| Cold prefill, 8K / 32K | 1,203 / 1,452 tok/s | 1,045 / 1,257 tok/s |
+| Extra disk | 98 GB expert pack + 195 MB draft pack per node, built once from the 198 GB EXL3 checkpoint | 195 MB draft pack per node, built once from ~14 GB of the EXL3 checkpoint (none with `DSV41_EXL3_DRAFT_DENSE=0`) |
 
 EXL3 reads fewer bytes per expert, which is most of a decode step, and leaves fewer
 experts missing; that is why it is the default. The cost is requantization error in the
 routed experts: choose FP4 to serve the checkpoint's own expert weights. Our tests
 do **not** establish that either profile answers better; they are throughput checks
 plus the engine's floor tests. In use, FP4 has sometimes answered specialised prompts
-better ([FP4 profile](#fp4-profile-native-mxfp4-experts)). See [the 2026-10-08 measurements](RESULTS.md) and
+better ([FP4 profile](#fp4-profile-native-mxfp4-experts)). See [the 2026-10-11 measurements](RESULTS.md) and
 [the EXL3 design notes](docs/exl3-plan.md).
 
 ## Performance
 
-Measured on two DGX Sparks on **2026-10-08**, both profiles on the same image at 92.3 GB/node:
+Measured on two DGX Sparks on **2026-10-11**, both profiles on the same image at 92.3 GB/node:
 512K context allocation, native dense precision, abliteration enabled, dynamic speculative
-depth and adaptation active. TTS was not loaded.
+depth and adaptation active, EXL3 draft blocks on. TTS was not loaded.
 
 | Workload | EXL3 decode | EXL3 time to first token | FP4 decode |
 | --- | ---: | ---: | ---: |
-| Python LRU cache with TTL, thread safety and tests | **46.7 tok/s** (45.8–47.7) | 0.47 s | 39.4 tok/s (38.6–40.2) |
-| Coastal-ecosystem essay | **31.0 tok/s** (30.3–31.6) | 0.55 s | 25.6 tok/s (25.5–25.7) |
-| Angry Birds single-file HTML game | **64.4 tok/s** (63.9–65.0) | 0.24 s* | 49.3 tok/s (49.1–49.5) |
+| Python LRU cache with TTL, thread safety and tests | **46.8 tok/s** (45.6–48.0) | 0.87 s | 40.7 tok/s (39.8–41.5) |
+| Coastal-ecosystem essay | **31.6 tok/s** (30.5–32.6) | 0.89 s | 28.5 tok/s (28.1–28.8) |
+| Angry Birds single-file HTML game | **62.8 tok/s** (62.8–62.8) | 0.22 s* | 55.2 tok/s (54.5–55.9) |
 
 Medians of two 512-token runs after one warmup each; thinking off, temperature zero,
 fixed output length. Decode speed excludes time to first token. *The HTML prompt reused
-its 62 cached prompt tokens; the others reused none. FP4's first-token times were 0.7–0.9 s
-except two requests that queued 16–24 s behind idle-time expert re-planning right after the
-profile switch. These are short throughput checks, not answer-quality tests. Prompt content,
+its 62 cached prompt tokens; the others reused none. FP4's first-token medians were 2.01 s
+(essay), 0.41 s (HTML) and 1.25 s (Python). These are short throughput checks, not
+answer-quality tests. Prompt content,
 draft acceptance, expert history and cache reuse affect speed. See [full results](RESULTS.md).
 
 Cold prefill (uncached random-word prompts; medians of 5 at 8K and 2 at 32K):
 
 | Prompt | EXL3 | FP4 | FP4 before 2026-10-08 |
 | --- | ---: | ---: | ---: |
-| 8K | **1,445 tok/s** (5.7 s) | 1,332 tok/s (6.2 s) | 390–470 tok/s (17–21 s) |
-| 32K | **1,394 tok/s** (23.5 s) | 1,441 tok/s (22.7 s) | 470 tok/s (70 s) |
+| 8K | **1,203 tok/s** (6.8 s) | 1,045 tok/s (7.8 s) | 390–470 tok/s (17–21 s) |
+| 32K | **1,452 tok/s** (22.6 s) | 1,257 tok/s (26.1 s) | 470 tok/s (70 s) |
 
 The first requests after a boot or profile switch run 1.5–3x slower while adaptation moves
 experts and kernels warm up. Prefill switches: `DSV41_ENGRAM_DIRECT=prefill`,
@@ -124,7 +126,8 @@ Switches: `DSV41_ATTN_STAGED=2`, `DSV41_ROUTER_BF16=1`, `DSV41_HC_KERNEL=1`. Dra
 `DSV41_TP_DRAFT_HEAD=1`, `DSV41_DRAFT_HEAD_FMT=fp8`, `DSV41_DRAFT_MARKOV_TP=1`,
 `DSV41_TP_DRAFT_ATTN=1`. Kernels: `DSV41_FP8_DECODE_BLOCK_N=32`, `DSV41_FP8_DECODE_BLOCK_K=256`,
 `DSV41_LEAN_RMS_FUSED=1`, `DSV41_HC_FRONT_FUSED=1`. Paired 22-prompt averages: **+9%**,
-**+2.3%** and **+2.1%**, **+1.8%** and **+4.0%**. Both profiles also queue the next draft
+**+2.3%** and **+2.1%**, **+1.8%** and **+4.0%**. The EXL3 draft blocks (`DSV41_EXL3_DRAFT_DENSE=1`,
+default since 2026-10-11): **-1.05 ± 0.37 ms** a step paired, outputs identical. Both profiles also queue the next draft
 before the host reads each verify result (`DSV41_EARLY_DRAFT`/`DSV41_EARLY_VERIFY`, on by
 default): -2.0 ± 0.5 ms a step, outputs bit-identical.
 
@@ -145,7 +148,7 @@ python3 bench/bench.py --model deepseek --workload code --osl 512 \
 
 You need two DGX Sparks, Docker with NVIDIA GPU support, a working RoCE link,
 and roughly 600 GB of local NVMe space per node for the checkpoint (the EXL3 profile
-adds a 98 GB pack per node). Enable head-to-worker SSH, and clone this repo to the
+adds a 98 GB pack per node; both profiles add a 195 MB draft pack). Enable head-to-worker SSH, and clone this repo to the
 same absolute path on both nodes:
 
 ```bash
@@ -180,8 +183,9 @@ both profiles use the same image:
 bash scripts/dual-build.sh
 ```
 
-**4. EXL3 packs** (EXL3 profile only, once; skip for FP4) — see
-[below](#exl3-expert-packs-once-for-the-exl3-profile).
+**4. EXL3 packs** (once): the expert and draft packs for the EXL3 profile, see
+[below](#exl3-expert-packs-once-for-the-exl3-profile); only the small draft packs for FP4, see
+[FP4 profile](#fp4-profile-native-mxfp4-experts).
 
 **5. Start** on the head:
 
@@ -211,24 +215,33 @@ bash scripts/exl3-packs.sh --check
 bash scripts/exl3-packs.sh       # ~8 min a rank, then copies rank 1's pack to the worker
 ```
 
-This writes one 98 GB pack per node to `<models>/exl3-packs/`, where the engine looks for it.
-Re-running keeps packs that already exist (`--force` rebuilds them). The EXL3 checkpoint
-and the head's copy of rank 1's pack can then be deleted.
+This writes one 98 GB expert pack and one 195 MB draft pack per node to `<models>/exl3-packs/`,
+where the engine looks for them. Re-running keeps packs that already exist (`--force` rebuilds
+them). The EXL3 checkpoint and the head's copy of rank 1's expert pack can then be deleted.
 
 ### FP4 profile (native MXFP4 experts)
 
-The FP4 profile serves the routed experts exactly as DeepSeek ships them, so it needs
-nothing beyond the native checkpoint: no EXL3 download, no packs.
+The FP4 profile serves the routed experts exactly as DeepSeek ships them. The only EXL3 part
+is the drafter's own draft pack (`DSV41_EXL3_DRAFT_DENSE=1`, on by default), which needs just
+the two EXL3 checkpoint shards that hold the draft blocks (~14 GB, head only):
 
 ```bash
 cp .env.example.fp4 .env         # then set the same five values as in step 1
 bash scripts/dual-build.sh       # skip if the image is already built
+hf download Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw config.json model.safetensors.index.json \
+  model-00038-of-00039.safetensors model-00039-of-00039.safetensors \
+  --local-dir /path/to/models/DeepSeek-V4.1-Flash-EXL3-2.9bpw   # next to the native checkpoint
+bash scripts/exl3-packs.sh --draft-only   # ~1 min a rank; copies rank 1's pack to the worker
 bash scripts/dual-up.sh
 ```
 
+The partial checkpoint can be deleted afterwards. To skip the EXL3 download entirely, set
+`DSV41_EXL3_DRAFT_DENSE=0`: the drafter then reads the checkpoint's FP8 draft blocks, about
+1 ms a step slower.
+
 `/health` shows `"expert_format": "fp4"` and `"kernel": "triton-fp4"`. At the same
 `ARENA_GB=92.3`, FP4 keeps 9,793 experts resident (64%) where EXL3 keeps 13,813, and
-decodes 16-23% slower ([table](#exl3-default-or-fp4-experts)). In exchange, the experts
+decodes 10-13% slower ([table](#exl3-default-or-fp4-experts)). In exchange, the experts
 are the checkpoint's own weights rather than a 2.9 bpw requantization (2-bit in layers
 18-22). **In our own use FP4 has sometimes given better answers**, for example on
 detailed security questions. That is an observation, not a measured result: our quality
