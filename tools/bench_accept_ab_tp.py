@@ -75,6 +75,14 @@ CONFIGS['heads_fp8'] = dict(CONFIGS['x3d_on'], draft_head_fmt='fp8', markov_fmt=
 CONFIGS['heads_fp4'] = dict(CONFIGS['x3d_on'], draft_head_fmt='fp4', markov_fmt='fp4')
 CONFIGS['heads_fp4_mk8'] = dict(CONFIGS['x3d_on'], draft_head_fmt='fp4', markov_fmt='fp8')
 CONFIGS['heads_fp8_mk4'] = dict(CONFIGS['x3d_on'], draft_head_fmt='fp8', markov_fmt='fp4')
+# The verifier's own LM head. `packed` is the lossless bf16 spelling the profile ships; `fp8` is
+# DSV41_HEAD_FMT=fp8, measured 2026-09-11 at 5.68 -> 2.96 ms for +0.0004 coding / +0.0014 general
+# nats. Load with DSV41_BENCH_DRAFT_HEAD_SRC=1 and HEAD_KERNEL=packed: the bf16 shard is the source
+# both heads are built from, and the drafter is held on the same separate fp8 head in both arms, so
+# only the verifier moves. This is a target-arithmetic change, not a draft one -- greedy outputs may
+# differ, which is why `head_fmt` is in target_keys below.
+CONFIGS['h_packed'] = dict(CONFIGS['x3d_on'], head_fmt='packed', draft_head='fp8')
+CONFIGS['h_fp8'] = dict(CONFIGS['x3d_on'], head_fmt='fp8', draft_head='fp8')
 for _qkv, _sh, _attn in ((24, 16, 4), (24, 16, 12), (12, 0, 4), (24, 0, 4), (0, 16, 4)):
     CONFIGS[f'cand_q{_qkv}_s{_sh}_a{_attn}'] = dict(CONFIGS['draft_fp8_split'], qkv_mb=_qkv, sh_mb=_sh, attn_mb=_attn)
 
@@ -120,6 +128,18 @@ def set_config(e, cfg):
         import fp8_linear as _fp8
         _fp8.DECODE_BLOCK_N, _fp8.DECODE_BLOCK_K = cfg['fp8_bn'], cfg['fp8_bk']  # read at call time
         lean.rms_fused, lean.hc_front_fused = cfg['rms_fused'], cfg['hc_front_fused']
+    if 'head_fmt' in cfg:
+        fmt = cfg['head_fmt']
+        src = getattr(e.W, 'draft_head_src', None)
+        assert src is not None, 'load with DSV41_BENCH_DRAFT_HEAD_SRC=1 to rebuild the verifier head'
+        bank = getattr(e, '_verifier_head_bank', None)
+        if bank is None:
+            bank = e._verifier_head_bank = {'packed': e.W.head}
+        if fmt not in bank:
+            from engine.tensor_parallel import VocabParallelHead
+            bank[fmt] = VocabParallelHead(v41_ref._head_in_format(src, fmt), e.W.head.world)
+        # fd.head and Model's three head_logits sites all read W.head.
+        e.W.head = fd.head = bank[fmt]
     if 'draft_head' in cfg:
         alt = getattr(e.W, 'draft_head', None)
         assert cfg['draft_head'] == 'main' or alt is not None, 'load with DSV41_TP_DRAFT_HEAD=1 DSV41_DRAFT_HEAD_FMT=fp8'
@@ -252,7 +272,7 @@ def main():
     usable = [i for i in range(len(ids)) if by[(i, args.a)]['steps'] >= 8 and by[(i, args.b)]['steps'] >= 8]
     # Target arithmetic keys; draft-only and exact-schedule (fp8_bn/fp8_bk) differences must leave
     # greedy outputs bit-identical, so those A/Bs assert it.
-    target_keys = list(CONFIGS['base']) + ['rms_fused', 'hc_front_fused', 'x3'] + list(_PREFILL_OFF)
+    target_keys = list(CONFIGS['base']) + ['rms_fused', 'hc_front_fused', 'x3', 'head_fmt'] + list(_PREFILL_OFF)
     draft_only = all(CONFIGS[args.a].get(k) == CONFIGS[args.b].get(k) for k in target_keys)
     report['summary'] = {
         'draft_only': draft_only,
