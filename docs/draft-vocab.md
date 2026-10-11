@@ -1,6 +1,6 @@
 # Listed draft vocabulary: `DSV41_DRAFT_VOCAB`
 
-Status (2026-10-11): built, measured, off by default. At 40,960 listed ids a rank, paired over the
+Status (2026-10-11): built, measured, on in the two-node example profiles (code default off). At 40,960 listed ids a rank, paired over the
 24-prompt gate with a warm-up before every measured run: **-1.06 +- 0.37 ms/step, +0.56 +- 0.22
 tok/s, acceptance -0.0013 +- 0.0013**, 24/24 greedy outputs bit-identical. The draft graph goes
 6.07 -> 4.58 ms a pass in rank-0 traces.

@@ -336,6 +336,8 @@ refer to the example profile, not every engine fallback default.
 | `DSV41_VISION=1` / `DSV41_VISION_MODE=peer` | Enable images and put the vision tower on rank 1. Set vision to `0` for text-only serving. |
 | `DSV41_PREFIX_CACHE=1` | Reuse matching prompt state in RAM. Keep `DSV41_PREFIX_DISK=0` and `DSV41_PREFIX_RESPONSE=0` with dynamic allocation. |
 | `SPEC=1` | Enable DSpark speculative decoding; `0` disables drafting. Speed depends on draft acceptance. |
+| `DSV41_EXPERT_TOPP=0.90` | Lossy decode pruning: per token, routed experts beyond 90% of the routing weight (at least 3 kept) are skipped. About 2 ms a step faster; held-out loss unchanged within ±0.006 nats, but greedy text can differ. `0` turns it off. |
+| `DSV41_DRAFT_VOCAB=/app/engine/draft_vocab_ranking_v1.txt` | The drafter scores 81,920 listed token ids instead of all 129,280. About 1 ms a step faster; output unchanged (the target verifies every token). Empty turns it off. |
 | `DSV41_HEAD_KERNEL=off` | Optional `packed` stores the native BF16 head losslessly and uses a decode kernel. Requires `DSV41_DRAFT_HEAD_FMT=off` or `bf16`. Saves about 146 MiB/node; measured code/prose decode gain was about 2%. |
 | `DEFAULT_THINKING=off` / `DEFAULT_EFFORT=75` | Defaults when the client does not specify thinking. Effort is 1–100 and applies when thinking is enabled; clients can override it per request. |
 
