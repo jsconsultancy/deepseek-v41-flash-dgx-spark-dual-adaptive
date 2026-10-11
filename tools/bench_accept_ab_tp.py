@@ -62,6 +62,19 @@ CONFIGS['early_on'] = dict(CONFIGS['fused_pf_new'], early_verify=True, early_dra
 # Decode attention + shared expert from the EXL3 dense pack (load with DSV41_EXL3_DENSE=1): numerics change.
 CONFIGS['x3_off'] = dict(CONFIGS['early_on'], x3=False)
 CONFIGS['x3_on'] = dict(CONFIGS['early_on'], x3=True)
+# The DSpark draft blocks' own attention + shared-expert matrices from the EXL3 draft pack (load
+# with DSV41_EXL3_DRAFT_DENSE=1). Draft-only: the draft proposes, the verifier accepts the target's
+# argmax, so greedy outputs must stay bit-identical and the paired deltas are pure proposal cost.
+CONFIGS['x3d_off'] = dict(CONFIGS['early_on'], x3d=False)
+CONFIGS['x3d_on'] = dict(CONFIGS['early_on'], x3d=True)
+# The drafter's own two heads, which are 21% and 14% of a draft pass's bytes (2026-10-11 trace):
+# the vocabulary projection (`draft_head_fmt`, rebuilt from the bf16 shard kept by
+# DSV41_BENCH_DRAFT_HEAD_SRC=1) and the five-times-read Markov bias head (`markov_fmt`). Both are
+# proposal-only, so greedy output must stay bit-identical and the deltas are pure draft cost.
+CONFIGS['heads_fp8'] = dict(CONFIGS['x3d_on'], draft_head_fmt='fp8', markov_fmt='off')
+CONFIGS['heads_fp4'] = dict(CONFIGS['x3d_on'], draft_head_fmt='fp4', markov_fmt='fp4')
+CONFIGS['heads_fp4_mk8'] = dict(CONFIGS['x3d_on'], draft_head_fmt='fp4', markov_fmt='fp8')
+CONFIGS['heads_fp8_mk4'] = dict(CONFIGS['x3d_on'], draft_head_fmt='fp8', markov_fmt='fp4')
 for _qkv, _sh, _attn in ((24, 16, 4), (24, 16, 12), (12, 0, 4), (24, 0, 4), (0, 16, 4)):
     CONFIGS[f'cand_q{_qkv}_s{_sh}_a{_attn}'] = dict(CONFIGS['draft_fp8_split'], qkv_mb=_qkv, sh_mb=_sh, attn_mb=_attn)
 
@@ -135,6 +148,27 @@ def set_config(e, cfg):
         assert e.exl3_dense is not None, 'load with DSV41_EXL3_DENSE=1'
         for L, w in enumerate(e.W.layers):
             w._x3 = e.exl3_dense.layers[L] if cfg['x3'] else None
+    if 'x3d' in cfg:
+        # `attach` already put these on the blocks; keep a bank so the off arm can restore them.
+        if not hasattr(e, '_x3d_bank'):
+            assert getattr(e, 'exl3_draft', None) is not None, 'load with DSV41_EXL3_DRAFT_DENSE=1'
+            e._x3d_bank = [(w._x3, w._x3sh) for w in e.W.mtp]
+        for w, (x3, sh) in zip(e.W.mtp, e._x3d_bank):
+            w._x3 = x3 if cfg['x3d'] else None
+            w._x3sh = sh if cfg['x3d'] else None
+    if 'draft_head_fmt' in cfg:
+        fmt = cfg['draft_head_fmt']
+        src = getattr(e.W, 'draft_head_src', None)
+        assert src is not None, 'load with DSV41_BENCH_DRAFT_HEAD_SRC=1 to rebuild the draft head'
+        bank = getattr(e, '_draft_head_bank', None)
+        if bank is None:
+            bank = e._draft_head_bank = {}
+        if fmt not in bank:
+            from engine.tensor_parallel import VocabParallelHead
+            bank[fmt] = VocabParallelHead(v41_ref._head_in_format(src, fmt), e.W.head.world)
+        fd.draft_head = bank[fmt]
+    if 'markov_fmt' in cfg:
+        fd.set_markov_fmt(cfg['markov_fmt'])
     if 'early_draft' in cfg:
         V.EARLY_VERIFY, V.EARLY_DRAFT = cfg['early_verify'], cfg['early_draft']  # read per step
     if lean.router_bf16:

@@ -40,6 +40,13 @@ last `RESULTS.md` sections first.
   unaccounted 40%. The 35 tok/s prose goal is an engine-wide Engram/draft target, not an EXL3 one.
 - **Re-enabled on exl3 (graphs are back)**: variable spec depth, predictive prefill, adaptive
   residency. Still FP4-only: critical prefill, layer streaming, the `_moe_merged` fusions.
+- **P7 done, off by default (2026-10-11)**: the three DSpark draft blocks' attention + shared-expert
+  matrices from their own 4-bit pack, `DSV41_EXL3_DRAFT_DENSE` — `tools/pack_exl3_draft.py`,
+  `engine/exl3_draft.py`, `tools/test_exl3_draft.py`. Two paired 24-prompt gates pool to **−1.05 ± 0.37 ms/step**,
+  24/24 bit-identical outputs, acceptance unchanged. The draft graph's span went 7.05 → 5.66 ms a
+  pass, from 10.40 on 2026-10-07. Measured and rejected there: the drafter's two *heads* at fp4
+  (+0.29 ± 1.03 ms) — they read at the box's plain-read ceiling, so a smaller format buys nothing.
+  See `docs/exl3-draft.md`.
 - **Decode tuning (2026-10-08, RESULTS.md)**: EXL3's routed MoE joined the merged decode collectives
   (`DSV41_EXL3_MERGED`, exact, ~-2 ms/step), the grouping kernel went parallel (48 -> 11 us a
   layer), draft-ahead + early verify (exact, -2.03 +- 0.49 ms/step paired), and the live resident

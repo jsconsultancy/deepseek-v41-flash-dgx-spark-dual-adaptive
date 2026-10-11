@@ -10,6 +10,7 @@
 #
 #   checkpoint   <models>/DeepSeek-V4.1-Flash-EXL3-2.9bpw   ~198 GB, this node only
 #   packs        <models>/exl3-packs/exl3-experts-r{0,1}of2.bin   ~98.3 GB each
+#                <models>/exl3-packs/exl3-draft-r{0,1}of2.safetensors ~195 MB each (EXL3 draft blocks)
 #   (<models> = MODELS_DIR, else MODEL_DIR's parent: where the engine looks for them)
 #
 # Usage: scripts/exl3-packs.sh [--check] [--force] [checkpoint-dir]
@@ -85,5 +86,30 @@ if [[ "$peer_has" != "$local_size" || "$FORCE" == true ]]; then
 fi
 peer_size=$(ssh -o BatchMode=yes "$PEER" "stat -c %s '$OUT/exl3-experts-r1of2.bin'")
 [[ "$peer_size" == "$local_size" ]] || err "rank 1's pack on $PEER is $peer_size bytes, here $local_size"
+
+# The DSpark draft blocks' own 4-bit matrices (~195 MB a rank) for DSV41_EXL3_DRAFT_DENSE. Tiny
+# next to the expert packs, so it is not budgeted above and it is built even when they exist.
+DRAFT_GB=1
+draft_need=0
+for r in 0 1; do
+    [[ -f "$OUT/exl3-draft-r${r}of2.safetensors" && "$FORCE" == false ]] || draft_need=$((draft_need + DRAFT_GB))
+done
+if (( draft_need > 0 )); then
+    (( have >= draft_need )) || err "this node has ${have} GB free under $OUT, the draft packs need ${draft_need} GB"
+    (( peer_free >= DRAFT_GB )) || err "$PEER has ${peer_free} GB free under $OUT, rank 1's draft pack needs ${DRAFT_GB} GB"
+    for r in 0 1; do
+        pack="$OUT/exl3-draft-r${r}of2.safetensors"
+        if [[ -f "$pack" && "$FORCE" == false ]]; then
+            info "draft rank $r: $pack exists, kept (--force rebuilds)"
+            continue
+        fi
+        info "draft rank $r: packing (~1 min)"
+        docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$HOST_MODELS:/models" \
+            --entrypoint python "$IMAGE" /app/tools/pack_exl3_draft.py \
+            --source "/models/${SRC#"$HOST_MODELS"/}" --out "/models/exl3-packs/exl3-draft-r${r}of2.safetensors" \
+            --rank "$r" --world 2
+    done
+    rsync -W --info=progress2 "$OUT/exl3-draft-r1of2.safetensors" "$PEER:$OUT/"
+fi
 info "done: rank 0 here, rank 1 on $PEER. Rank 1's local copy ($OUT/exl3-experts-r1of2.bin) is no longer
     needed on this node; delete it to reclaim ~98 GB. The boot guard checks both packs share one source."

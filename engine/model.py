@@ -300,6 +300,13 @@ class Weights:
             shard = head.chunk(world, dim=0)[rank].to(device)
             self.head = VocabParallelHead(R.make_head(shard), world)
             self.draft_head = make_tp_draft_head(self.head, load_mtp=load_mtp, source=shard)
+            # Benchmark-only (DSV41_BENCH_DRAFT_HEAD_SRC): keep this rank's bf16 vocabulary shard so
+            # a driver can rebuild the draft head in another format and A/B the two inside one
+            # process. The head format is a load-time choice otherwise, and comparing two of them
+            # across processes costs a run-to-run drift larger than the effect. 662 MB a rank;
+            # never set in serving.
+            if os.environ.get('DSV41_BENCH_DRAFT_HEAD_SRC', '0') == '1':
+                self.draft_head_src = shard.clone()
             del shard
         else:
             self.head = R.make_head(head.to(device))

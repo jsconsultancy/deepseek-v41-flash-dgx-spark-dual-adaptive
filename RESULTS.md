@@ -3538,3 +3538,85 @@ Health reports `mode=apply`, `backend=probe`; no legacy predictor variables are
 present in the serving environment. The latest learned demand DB was preserved
 byte-for-byte on both nodes through boot. This is a deployment/configuration
 check, not a new speed or answer-quality measurement.
+
+### 2026-10-11 — the DSpark draft blocks' own weights in EXL3, and why the drafter's heads are not next
+
+Serving stopped on both nodes; every number below is from the disposable two-node gate
+(`tools/run_two_node_gate.sh`, `GATE_SOURCE_ROOT` snapshot `exl3-draft-v3`), `EXPERT_FORMAT=fp4`,
+frozen-demand map, depth pinned to 3, prefix cache/disk/adaptation off, 24 varied prompts, 160
+tokens, arms interleaved per prompt with the order alternating. Artifacts under
+`results/exl3-draft-ab/` (raw logs and traces are ignored, not committed).
+
+**The change.** `DSV41_EXL3_DRAFT_DENSE=1` reads the three `mtp.*` blocks' attention and
+shared-expert matrices from a new 4-bit pack (`tools/pack_exl3_draft.py`, ~195 MB a rank) instead of
+the checkpoint's fp8. The drafter only proposes and the verifier accepts exactly the target's
+argmax, so this is the one weight-format change in the engine with no quality claim to defend — a
+worse drafter costs throughput, never a token. It is a separate pack from the 2.1 GB backbone dense
+one so it also works under `EXPERT_FORMAT=fp4`. Design and wiring: `docs/exl3-draft.md`.
+
+| paired, 24 prompts, 23 usable (≥ 8 steps both arms) | run 1 | run 2 (final) | pooled |
+| --- | ---: | ---: | ---: |
+| ms/step | −0.894 ± 0.440 | −1.401 ± 0.673 | **−1.05 ± 0.37** |
+| accepted tokens/step | −0.0070 ± 0.0128 | −0.0070 ± 0.0128 | −0.0070 ± 0.0128 |
+| tok/s | +0.313 ± 0.232 | +0.620 ± 0.389 | **+0.39 ± 0.20** |
+| greedy outputs | 24 / 24 | 24 / 24 | |
+
+Two runs of one configuration, pooled by inverse variance. They are pooled rather than averaged
+because they are the same paired measurement: each run interleaves its own two arms per prompt, so
+the paired delta is drift-robust, while the two runs' *absolute* levels drifted 1.6 ms/step apart
+(75.90 vs 74.26 ms in the off arm) — which is itself the reason every cross-process comparison here
+was abandoned. Acceptance is identical to the digit in both runs: the two arms' drafts are the same
+tokens, so the accepted length is reproducible even though the timings are not.
+
+The identical-output count is a consequence of exact verification, not a coincidence, and the driver
+asserts it for any draft-only arm. `tools/test_exl3_draft.py` separately checks the pack against
+`exl3_ref` and against the **full source matrix's** rank slice (0.00e+00), row invariance, and the
+shared expert's `w1‖w3` group order; `tools/test_exl3_dense.py` still passes after `_Members` gained
+the G=2 table that the shared expert's pair needs.
+
+**Where a draft pass goes now.** Rank-0 kernel traces, 12 passes, analysed per CUDA graph with the
+new `tools/decode_graph_families.py` (which reproduces the 2026-10-07 table exactly):
+
+| draft graph, ms a pass | 2026-10-07 | 2026-10-11 off | 2026-10-11 on |
+| --- | ---: | ---: | ---: |
+| **span** | **10.40** | **7.05** | **5.66** |
+| drafter LM head | 2.95 bf16 | 1.47 fp8 | 1.47 fp8 |
+| Markov bias head | 1.56 bf16 ×5 | 0.79 bf16 ×5 | 0.79 bf16 ×5 |
+| draft block dense | 1.95 fp8 | 3.09 fp8 | **0.93 EXL3** |
+| routed experts (fp4) | 1.20 | 1.12 | 1.12 |
+| communication | 0.72 | 0.46 | 0.46 |
+| fp32 / mHC / norms / other | 0.94 | 1.24 | 0.85 |
+
+The 10.40 → 7.05 drop is the 2026-10-08 levers (`TP_DRAFT_HEAD` + `DRAFT_MARKOV_TP`, then
+`TP_DRAFT_ATTN`), which took the two head rows. The 7.05 → 5.66 drop is this change: the fp8 dense
+family went 3.09 → 1.47 and came back as 0.93 ms of `exl3::grouped_kernel`, 21 launches a pass for
+the 21 matrices (7 a block). The 2026-10-07 trace's "4.51 ms of BF16 matmuls" resolves to one
+2.95 ms call (grid `[8,505]`, 505 × 128 = 64,640 = vocabulary/2 at 224 GB/s) plus five 0.31 ms
+calls — the drafter's LM head and its Markov bias head, nothing to do with the draft blocks.
+
+**Measured and rejected: the drafter's heads at fp4.** The two remaining head rows are the obvious
+next target, so they were measured properly rather than inferred — `DSV41_MARKOV_HEAD_FMT=fp4` and
+`DSV41_DRAFT_HEAD_FMT=fp4`, switched **inside one process** (a new benchmark-only
+`DSV41_BENCH_DRAFT_HEAD_SRC` keeps the rank's bf16 vocabulary shard so the draft head can be rebuilt
+in another format; cross-process comparisons at this size are useless, and two same-day runs of
+identical configs differed by 1.5 ms/step).
+
+**+0.29 ± 1.03 ms/step, acceptance −0.018 ± 0.014.** No effect. The fp8 draft head draws 331 MB in
+1.47 ms — 225 GB/s, the box's plain-read ceiling — so fp4's half-size read is not a half-time read,
+and the FP4 Triton kernel's cost per byte at M = 5/6 consumes the whole saving; a five-times-repeated
+M = 1 GEMV over 33 MB behaves the same way. At these shapes "fewer bytes" and "less time" have come
+apart. The draft pass launches 335 kernel nodes against TensorFold's 147, so what is left there is
+fusing its elementwise/mHC/norm chain, not a smaller format.
+
+**Not the same lever, and bigger: the verifier's head.** `DSV41_HEAD_FMT=fp8` was measured on
+2026-09-11 at **2.96 ms against bf16's 5.68 ms** for +0.0004 coding / +0.0014 general nats, and that
+addendum made it the default; the profile has since moved to lossless `DSV41_HEAD_KERNEL=packed`
+(+2% decode, bit-identical) and the two are mutually exclusive. That is roughly 2.7 ms/step of the
+*verify* step — about four times the whole draft pass's remaining gap to TensorFold's 3.72 ms. It is
+a quality decision rather than an engineering one, and nothing here argues for either profile.
+
+**State.** `DSV41_EXL3_DRAFT_DENSE` is off by default in `.env.example.exl3`; the packs already exist
+on both nodes at `~/models/exl3-packs/exl3-draft-r{0,1}of2.safetensors`
+(`source 464d2dc4d3edbc48`). `scripts/exl3-packs.sh` now builds them alongside the expert packs. The
+default FP8 path is unchanged: `set_markov_fmt('off')` returns the same tensor and the same row view
+the drafter passed cuBLAS before.

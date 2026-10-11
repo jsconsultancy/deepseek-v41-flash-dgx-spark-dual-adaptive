@@ -88,6 +88,13 @@ LEAN_ATTN = os.environ.get("DSV41_DECODE_LEAN_ATTN", "1") == "1"
 # over the RoCE one-shot path instead of moe_forward's two NCCL ring gathers. Exact (same kernels,
 # same fp32 sum order); changes the collectives both ranks run, so the boot guard pins it.
 EXL3_MERGED = os.environ.get("DSV41_EXL3_MERGED", "1") == "1"
+# The drafter's Markov chain bias head, quantized (engine/fastdecode.py FastDecoder.__init__). The
+# draft-only head format (DSV41_DRAFT_HEAD_FMT) covers the vocabulary projection; this one covers
+# the five sequential GEMVs that chain the draft positions, which is a separate 66 MB bf16 read.
+# Proposals only, so greedy output is unchanged -- but acceptance still moves, so it is opt-in.
+MARKOV_HEAD_FMT = os.environ.get("DSV41_MARKOV_HEAD_FMT", "off").strip().lower() or "off"
+if MARKOV_HEAD_FMT not in ("off", "bf16", "fp8", "fp4"):
+    raise ValueError("DSV41_MARKOV_HEAD_FMT must be off, bf16, fp8 or fp4")
 
 
 def merge_decode_projections(weights) -> int:
@@ -247,7 +254,11 @@ class FastDecoder:
         if not (0 <= self.qkv_prefetch_mb <= 24 and 0 <= self.sh_prefetch_mb <= 24):
             raise ValueError("DSV41_L2PF_QKV_MB and DSV41_L2PF_SH_MB must be in 0..24")
         self._pf_ev = {}
-        # Before any capture: graphs bake in weight addresses.
+        # Before any capture: graphs bake in weight addresses. The MTP blocks are merged even when
+        # the EXL3 draft matrices replace what the merge feeds: the merged FP8 tensors are then
+        # dead (~100 MB a rank), but an A/B against `DSV41_EXL3_DRAFT_DENSE=0` must compare the
+        # shipped FP8 spelling, not a slower unmerged one. Skipping the MTP merge once the EXL3
+        # draft is kept is a separate change, worth ~100 MB of arena.
         self.merged_proj = (merge_decode_projections(list(self.W.layers) + list(self.W.mtp))
                             if MERGED_PROJ else 0)
         self.lean = None
@@ -299,7 +310,6 @@ class FastDecoder:
         # Routers read the original FP32 gate_w below. Do not retain the unused BF16
         # copies: 40 backbone + 3 draft gates cost 153.75 MiB per rank without a consumer.
         self.markov_embed_bf16 = self.W.mtp[2].markov_embed.to(torch.bfloat16)
-        self.markov_head_bf16 = self.W.mtp[2].markov_head.to(torch.bfloat16)
         # Proposal-only shortlist. The target still verifies every emitted token.
         # Kept opt-in: changing proposals can reduce acceptance even with a faster draft pass.
         self.draft_markov_topk = int(os.environ.get('DSV41_DRAFT_MARKOV_TOPK', '0'))
@@ -313,12 +323,15 @@ class FastDecoder:
         # vocabulary half, so the five 66 MB Markov GEMVs read 33 MB each and the 2.6 MB logits
         # gather becomes five 8-byte gathers. Proposals match the full chain up to GEMV rounding.
         self.draft_markov_tp = os.environ.get('DSV41_DRAFT_MARKOV_TP', '0') == '1'
-        self._markov_rank = 0
-        if hasattr(self.draft_head, 'world'):
-            # The same rank model.py used to pick this head's vocabulary shard.
-            self._markov_rank = int(os.environ.get('RANK', '0'))
-            rows = self.draft_head.local.shape[0]
-            self.markov_head_local = self.markov_head_bf16[self._markov_rank * rows:(self._markov_rank + 1) * rows]
+        self._markov_rank = int(os.environ.get('RANK', '0')) if hasattr(self.draft_head, 'world') else 0
+        # The Markov chain's per-position bias is one GEMV against a [129280, 256] matrix, five
+        # times a draft pass: 66 MB of bf16 even with DRAFT_MARKOV_TP halving it, and the same
+        # weights every read. `_lin` already dispatches a quantized weight to its Triton kernel, so
+        # the read shrinks by the format's ratio and nothing else changes. Proposals only: the
+        # verifier still accepts exactly the target's argmax, so greedy output is unaffected.
+        self.markov_head_bf16 = None
+        self.markov_head_local = None
+        self.set_markov_fmt(MARKOV_HEAD_FMT)
         self.win_off = torch.arange(a.window_size - 1, -1, -1, device=dev)
         self._index_cpos = torch.arange(self._n_cache(1), device=dev)
         self.graphs = OrderedDict()
@@ -480,6 +493,22 @@ class FastDecoder:
         return y
 
     def _shared_ffn(self, y, w):
+        x3 = getattr(w, "_x3sh", None)
+        if x3 is not None:
+            # EXL3 shared expert (engine/exl3_draft.py). w13 is two groups over one input, so the
+            # input is duplicated on the group axis; the output is [T, 2N] with w1's columns first,
+            # the order `expert_ffn` slices at `sh_w1.N`. The tail is `expert_ffn`'s, with the
+            # elementwise middle as one kernel when the lean ops are available.
+            mh = y if y.dtype == torch.bfloat16 else y.to(torch.bfloat16)
+            gu = x3.w13(mh[:, None, :].expand(-1, 2, -1))
+            if self.lean is not None:
+                return x3.w2(self.lean.swiglu(gu, x3.n, self.a.swiglu_limit))
+            gate, up = gu[..., :x3.n].float(), gu[..., x3.n:].float()
+            limit = self.a.swiglu_limit
+            if limit > 0:
+                up = torch.clamp(up, min=-limit, max=limit)
+                gate = torch.clamp(gate, max=limit)
+            return x3.w2((F.silu(gate) * up).to(torch.bfloat16))
         w13 = getattr(w, "_sh_w13", None) if MERGED_PROJ else None
         if self.lean is not None and w13 is not None and y.dtype == torch.bfloat16:
             # v41_ref.expert_ffn with its elementwise middle as one kernel (engine/decode_lean.py)
@@ -495,7 +524,10 @@ class FastDecoder:
         fq = (self._step_memo(("fq", freqs.data_ptr()), lambda: freqs[pos]) if lean_step
               else freqs[pos])
         both = getattr(w, "_wqkv_a", None) if MERGED_PROJ else None
-        x3 = getattr(w, "_x3", None) if mtp_last is None else None
+        # `_x3` is set by engine/exl3_dense.py on backbone layers and by engine/exl3_draft.py on the
+        # draft blocks; the projection path below is the same for both, `mtp_last` only chooses how
+        # the keys are gathered. The old `if mtp_last is None` guard predates the draft pack.
+        x3 = getattr(w, "_x3", None)
         if x3 is not None:
             # EXL3 decode matrices (engine/exl3_dense.py): two GEMVs, each with its own input rotation
             self._pf_wait("qkv")
@@ -784,6 +816,26 @@ class FastDecoder:
         """Wait for every outstanding prefetch: graph capture must rejoin the side stream."""
         for key in list(self._pf_ev):
             self._pf_wait(key)
+
+    def set_markov_fmt(self, fmt: str):
+        """(Re)build the Markov bias head in `fmt` from the bf16 source on `self.W.mtp[2]`.
+
+        `off`/`bf16` share the source tensor. The two shards are quantized from their own rows
+        rather than sliced out of a quantized whole: a block scale straddling the vocabulary split
+        would be wrong, and the ranks score their halves independently anyway.
+        """
+        if fmt not in ('off', 'bf16', 'fp8', 'fp4'):
+            raise ValueError(f"markov head format {fmt!r} must be off, bf16, fp8 or fp4")
+        self.markov_fmt = fmt
+        src = self.W.mtp[2].markov_head
+        self.markov_head_bf16 = src if fmt in ('off', 'bf16') else R._head_in_format(src, fmt)
+        if self.markov_head_local is not None or hasattr(self.draft_head, 'world'):
+            rows = self.draft_head.local.shape[0]
+            # off/bf16 keep the strided row view the drafter always passed cuBLAS; only a quantized
+            # copy needs its own contiguous storage.
+            local = src[self._markov_rank * rows:(self._markov_rank + 1) * rows]
+            self.markov_head_local = (local if fmt in ('off', 'bf16')
+                                      else R._head_in_format(local.contiguous(), fmt))
 
     def _layer_a(self, L, sh_state):
         """attention + HC + router for backbone layer L, reading self.h/self.pre_mix/self.pos."""
@@ -1170,10 +1222,19 @@ class FastDecoder:
         self.logits.copy_(R.head_logits(x, self.head))
         # seed the drafter rings for all 6 positions (harmless beyond the accepted ones)
         m0 = self.W.mtp[0]
-        main_x = self._rmsnorm(R.qlinear(self.main_hidden.to(torch.bfloat16), m0.main_proj), m0.main_norm, a.norm_eps)
+        x3 = getattr(m0, "_x3", None)
+        mh = self.main_hidden.to(torch.bfloat16)
+        proj = (x3.main_proj(mh) if x3 is not None and x3.main_proj is not None
+                else R.qlinear(mh, m0.main_proj))
+        main_x = self._rmsnorm(proj, m0.main_norm, a.norm_eps)
         fq = self.m.freqs_w[self.pos]
         for k, w in enumerate(self.W.mtp):
-            kv = self._rope(self._rmsnorm(R.qlinear(main_x, w.wkv), w.kv_norm, a.norm_eps), fq)
+            # Same weights as the draft's own attention below: the ring value a draft key is
+            # compared against must come from the same projection the draft reads, or the EXL3
+            # switch would only move half of the draft's keys.
+            kx3 = getattr(w, "_x3", None)
+            kv_in = kx3.wkv(main_x) if kx3 is not None else R.qlinear(main_x, w.wkv)
+            kv = self._rope(self._rmsnorm(kv_in, w.kv_norm, a.norm_eps), fq)
             self.c.mtp_win[k][self.pos % M.RING] = kv
 
     def _draft(self, greedy: bool):

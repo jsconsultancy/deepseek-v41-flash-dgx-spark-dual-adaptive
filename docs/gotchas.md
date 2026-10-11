@@ -2329,3 +2329,27 @@ refused for lack of a vision tower), but the checkpoint encoder's `_process_imag
 knows `image` and `image_url`. An `input_image` block therefore renders as
 `[Unsupported input_image]` and its pixels are dropped silently. No client in the DSH incident
 sent one; a Responses-API client would need this normalised to `image_url` first.
+
+## The drafter's heads are at the memory ceiling, not limited by their format (2026-10-11)
+
+The obvious next move after `DSV41_EXL3_DRAFT_DENSE` (`docs/exl3-draft.md`) is to quantize the
+drafter's other two weight matrices: its LM head (fp8, 331 MB a draft pass, one call) and its Markov
+bias head (bf16, 33 MB read five times, 165 MB total). Both were measured through
+`DSV41_MARKOV_HEAD_FMT` and `DSV41_DRAFT_HEAD_FMT=fp4`, with the two formats switched inside one
+process so run-to-run drift could not fake an effect.
+
+**They do not help: +0.29 ± 1.03 ms/step**, and acceptance −0.018 ± 0.014 accepted tokens/step.
+
+The reason is worth keeping. The fp8 draft head's single `_fp8_linear_kernel` call is grid
+`[2020, 1, 1]` × 32 = 64,640 = vocabulary/2, and it draws 331 MB in 1.47 ms — **225 GB/s, which is
+this box's plain-read ceiling.** fp4 halves the bytes to 165 MB and is not faster, so the FP4 Triton
+kernel's cost per byte at M = 5/6 consumes the entire saving. A GEMV at M = 1 against a 33 MB matrix
+is the same story. Do not reach for a smaller format here without measuring it: on this box, at these
+shapes, "fewer bytes" and "less time" have come apart for the draft's heads while they still hold for
+the routed experts and the dense projections.
+
+The draft pass is 335 kernel nodes against TensorFold's 147, so the remaining work on it is fusing
+its elementwise/mHC/norm chain, not a format change. (For scale: the *verifier's* head is a different
+lever entirely — `HEAD_FMT=fp8` was measured at 2.96 ms against bf16's 5.68 ms for +0.0004 nats, and
+the profile currently runs lossless `HEAD_KERNEL=packed` instead. That is a quality decision, and it
+is four times the draft's remaining gap.)

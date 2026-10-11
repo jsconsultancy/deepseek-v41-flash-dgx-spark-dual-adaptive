@@ -60,7 +60,8 @@ class _Members:
 
     def __init__(self, device):
         self.t = {}
-        for G in (1, 4):
+        # G=2 is the draft's shared expert: w1||w3 as two groups over one input (engine/exl3_draft).
+        for G in (1, 2, 4):
             uids = torch.arange(G, dtype=torch.int32, device=device)
             count = torch.tensor([G], dtype=torch.int32, device=device)
             for T in range(1, MAX_ROWS + 1):

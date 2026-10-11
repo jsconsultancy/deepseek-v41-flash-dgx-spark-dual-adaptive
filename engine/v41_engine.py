@@ -25,6 +25,7 @@ from engine import ablit as R_ablit  # noqa: E402
 from engine.engram import EngramReadAhead, EngramTable, make_hash_state, prefetch_rows  # noqa: E402
 from engine.model import MAX_CHUNK, PRUNE_MISS, Caches, Model, Weights  # noqa: E402
 from engine import model as M_  # noqa: E402  (ATTN_TIMING phase table)
+from engine import fastdecode as _FD  # noqa: E402  (format flags pinned in the boot guard)
 from engine.prefix_media import image_fingerprints, media_prefix
 from engine.prefix_persistence import PREFIX_DISK_MIN_INTERVAL_S
 import v41_ref as R  # noqa: E402
@@ -866,6 +867,34 @@ class V41Engine:
             log(f"EXL3 dense decode matrices: {self.exl3_dense.bytes / 2**30:.2f} GiB in "
                 f"{time.perf_counter() - _t0:.1f}s, source {self.exl3_dense.source_sha256[:16]}, "
                 f"ablit {'rank-1 term' if have else 'off'}")
+        # DSV41_EXL3_DRAFT_DENSE: the DSpark draft blocks' attention and shared-expert matrices from
+        # their own pack (engine/exl3_draft.py). Deliberately separate from the backbone dense pack:
+        # the draft only proposes, and the verifier accepts exactly the target's argmax, so this is
+        # a speed knob with no quality claim -- it must not require the backbone's pack, and it must
+        # be runnable under EXPERT_FORMAT=fp4 as well.
+        self.exl3_draft = None
+        from engine import exl3_draft as _X3DR
+        if _X3DR.enabled():
+            if not self.ep.tensor_parallel or self.ep.world != 2:
+                raise ValueError("DSV41_EXL3_DRAFT_DENSE needs the two-rank TP draft")
+            if (os.environ.get("DSV41_TP_DRAFT_ATTN", "0") != "1"
+                    or os.environ.get("DSV41_TP_LINEAR_LAYOUT", "output") != "output"):
+                raise ValueError("the EXL3 draft pack is sliced for DSV41_TP_DRAFT_ATTN=1 with the "
+                                 "output layout (tools/pack_exl3_draft.py)")
+            import exl3_moe as _X3M
+            if not _X3M.cuda_available():
+                raise ValueError("DSV41_EXL3_DRAFT_DENSE needs the EXL3 JIT decode kernel")
+            _t0 = time.perf_counter()
+            self.exl3_draft = _X3DR.Exl3Draft(_X3DR.pack_path(model_dir, self.ep.rank, self.ep.world),
+                                              device, self.ep.rank, self.ep.world)
+            if (self.exl3_dense is not None
+                    and self.exl3_draft.source_sha256 != self.exl3_dense.source_sha256):
+                raise ValueError("the EXL3 draft pack and the EXL3 dense pack were built from "
+                                 "different checkpoints")
+            self.exl3_draft.attach(self.W.mtp)
+            log(f"EXL3 draft matrices: {self.exl3_draft.bytes / 2**30:.3f} GiB in "
+                f"{time.perf_counter() - _t0:.1f}s, source {self.exl3_draft.source_sha256[:16]}, "
+                f"bits {sorted(set(self.exl3_draft.bits.values()))}")
         if R.dense_fp4_groups():
             # the load-time fp8 -> fp4 re-quantization leaves ~2.4 GB of fp32 scratch blocks in the
             # caching allocator; hand them back before the expert arena asks for its 90 GB.
@@ -1352,6 +1381,7 @@ class V41Engine:
                 "head_kernel": head_kernel(),
                 "head_kernel_version": HEAD_KERNEL_VERSION,
                 "draft_head_fmt": R.draft_head_fmt(),
+                "markov_head_fmt": _FD.MARKOV_HEAD_FMT,
                 "tp_draft_head": tp_draft_head_enabled(),
                 "tp_draft_head_version": TP_DRAFT_HEAD_VERSION,
                 "lookup_draft_enabled": LOOKUP_DRAFT_ENABLED,
@@ -1418,6 +1448,8 @@ class V41Engine:
                 "exl3_exact_slots": list(self.exl3_exact) if self.exl3_exact else None,
                 "exl3_dense": (self.exl3_dense.source_sha256 if self.exl3_dense is not None else None),
                 "exl3_dense_version": 1,
+                "exl3_draft_dense": (self.exl3_draft.source_sha256 if self.exl3_draft is not None else None),
+                "exl3_draft_dense_version": 1,
                 "attn_staged": os.environ.get("DSV41_ATTN_STAGED", "0"),
                 "prune_miss_fused": os.environ.get("DSV41_PRUNE_MISS_FUSED", "1") == "1",
                 "fp8_act_qdq_fused": os.environ.get("DSV41_FP8_ACT_QDQ_FUSED", "1") == "1",
@@ -3515,6 +3547,7 @@ class V41Engine:
             "roce_max_kb": os.environ.get("DSV41_ROCE_MAX_KB", "256"),
             "ablate_wob": R_ablit.enabled(),
             "draft_head_fmt": R.draft_head_fmt(),
+            "markov_head_fmt": _FD.MARKOV_HEAD_FMT,
             "tp_draft_head": os.environ.get('DSV41_TP_DRAFT_HEAD', '0') == '1',
             "draft_head_bytes": getattr(self.W, 'draft_head_bytes', 0),
             "lookup_draft_enabled": LOOKUP_DRAFT_ENABLED,
@@ -3535,6 +3568,8 @@ class V41Engine:
             "early_draft": EARLY_DRAFT,
             "exl3_dense": (os.path.basename(self.exl3_dense.path) if self.exl3_dense is not None else None),
             "exl3_dense_gib": (round(self.exl3_dense.bytes / 2**30, 2) if self.exl3_dense is not None else 0),
+            "exl3_draft_dense": (os.path.basename(self.exl3_draft.path) if self.exl3_draft is not None else None),
+            "exl3_draft_dense_gib": (round(self.exl3_draft.bytes / 2**30, 3) if self.exl3_draft is not None else 0),
             "exl3_merged": (os.environ.get("DSV41_EXL3_MERGED", "1") == "1"
                             if self.expert_format == "exl3" else None),
             "batched_verify": self.batched_verify,
