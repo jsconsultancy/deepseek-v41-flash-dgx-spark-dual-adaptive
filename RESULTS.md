@@ -3725,3 +3725,24 @@ Separately, both arms of the FP4 gate mistranslate the French prompt ("Le rendez
 to Thursday afternoon...", "...verplaatst naar de namiddag..."), as every FP4 gate run since
 2026-10-08 did; both EXL3 arms translate it correctly. See docs/gotchas.md.
 Artifacts: `results/expert-topp-20261011/ab-{fp4,exl3}/`.
+
+### 2026-10-11 (evening) — README numbers with expert top-p and the listed draft vocabulary on
+
+Same protocol as the morning's README run (results/readme-20261011b/: 92.3 GB/node, 512K context,
+warmup + 2 x 512 tokens, 8K x5 / 32K x2 cold prefill), now booted with plain `scripts/dual-up.sh`
+from the `20261011-topp` image (main at f9e5248), profiles' defaults: EXL3 draft blocks, listed
+draft vocabulary, DSV41_EXPERT_TOPP=0.90. `/health` checked before measuring.
+
+| | FP4 | EXL3 |
+| --- | ---: | ---: |
+| Residents | 9,793 (63.8%) | 13,813 (89.9%) |
+| Essay / HTML / Python decode, tok/s | 31.2 / 57.8 / 42.5 | 32.2 / 67.3 / 46.6 |
+| (morning, EXL3 draft only) | 28.5 / 55.2 / 40.7 | 31.6 / 62.8 / 46.8 |
+| 8K prefill, median (runs) | 8.29 s (11.79, 9.70, 8.29, 7.04, 6.38) | 5.85 s (8.29, 5.76, 5.66, 5.87, 5.85) |
+| 32K prefill | 24.73 s (26.99, 22.48) | 21.21 s (21.30, 21.13) |
+
+Against the morning: FP4 +9.5 / +4.7 / +4.4%, EXL3 +1.9 / +7.2 / -0.4%. The paired measurements
+put the two levers at about +5% together (top-p -2.2 / -1.9 ms/step, the listed vocabulary -1.06);
+two-run medians across boots scatter several percent either way (FP4's essay runs span 29.4-33.0),
+so read the per-workload deltas as that, not as the levers' effect per workload. Prefill does not
+run either lever; its movement against the morning (EXL3 8K 6.81 -> 5.85 s) is run-to-run.

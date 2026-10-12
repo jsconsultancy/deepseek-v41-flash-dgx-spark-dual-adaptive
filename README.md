@@ -15,8 +15,8 @@ see [lineage](#lineage-and-credits) for what is inherited and what changed.
 
 | Default EXL3 profile, 2026-10-11 | |
 | --- | --- |
-| Decode, essay / HTML game / Python | **31.6 / 62.8 / 46.8 tok/s** (FP4: 28.5 / 55.2 / 40.7) |
-| Cold prefill, 8K / 32K | **1,203 / 1,452 tok/s** (FP4: 1,045 / 1,257) |
+| Decode, essay / HTML game / Python | **32.2 / 67.3 / 46.6 tok/s** (FP4: 31.2 / 57.8 / 42.5) |
+| Cold prefill, 8K / 32K | **1,401 / 1,545 tok/s** (FP4: 988 / 1,325) |
 | Resident routed experts at 92.3 GB/node | **13,813 of 15,360 (90%)** (FP4: 9,793, 64%) |
 
 At the default arena not every routed expert is resident; residency follows demand and is
@@ -68,8 +68,8 @@ this changes speed, not output.
 | --- | --- | --- |
 | Routed expert weights | [Mia-AiLab's](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw) EXL3, 2.9 bpw average (2-bit in layers 18-22), 6.67 MB/node each | Checkpoint MXFP4, 9.4 MB/node each |
 | Resident experts | **13,813 (90%)** | 9,793 (64%) |
-| Decode, essay / HTML / Python | **31.6 / 62.8 / 46.8 tok/s** | 28.5 / 55.2 / 40.7 tok/s |
-| Cold prefill, 8K / 32K | 1,203 / 1,452 tok/s | 1,045 / 1,257 tok/s |
+| Decode, essay / HTML / Python | **32.2 / 67.3 / 46.6 tok/s** | 31.2 / 57.8 / 42.5 tok/s |
+| Cold prefill, 8K / 32K | 1,401 / 1,545 tok/s | 988 / 1,325 tok/s |
 | Extra disk | 98 GB expert pack + 195 MB draft pack per node, built once from the 198 GB EXL3 checkpoint | 195 MB draft pack per node, built once from ~14 GB of the EXL3 checkpoint (none with `DSV41_EXL3_DRAFT_DENSE=0`) |
 
 EXL3 reads fewer bytes per expert, which is most of a decode step, and leaves fewer
@@ -84,18 +84,19 @@ better ([FP4 profile](#fp4-profile-native-mxfp4-experts)). See [the 2026-10-11 m
 
 Measured on two DGX Sparks on **2026-10-11**, both profiles on the same image at 92.3 GB/node:
 512K context allocation, native dense precision, abliteration enabled, dynamic speculative
-depth and adaptation active, EXL3 draft blocks on. TTS was not loaded.
+depth and adaptation active, EXL3 draft blocks, listed draft vocabulary and expert top-p 0.90 on
+(the profiles' defaults). TTS was not loaded.
 
 | Workload | EXL3 decode | EXL3 time to first token | FP4 decode |
 | --- | ---: | ---: | ---: |
-| Python LRU cache with TTL, thread safety and tests | **46.8 tok/s** (45.6–48.0) | 0.87 s | 40.7 tok/s (39.8–41.5) |
-| Coastal-ecosystem essay | **31.6 tok/s** (30.5–32.6) | 0.89 s | 28.5 tok/s (28.1–28.8) |
-| Angry Birds single-file HTML game | **62.8 tok/s** (62.8–62.8) | 0.22 s* | 55.2 tok/s (54.5–55.9) |
+| Python LRU cache with TTL, thread safety and tests | **46.6 tok/s** (46.5–46.8) | 0.84 s | 42.5 tok/s (42.1–42.9) |
+| Coastal-ecosystem essay | **32.2 tok/s** (32.1–32.3) | 0.90 s | 31.2 tok/s (29.4–33.0) |
+| Angry Birds single-file HTML game | **67.3 tok/s** (67.0–67.6) | 0.27 s* | 57.8 tok/s (56.8–58.8) |
 
 Medians of two 512-token runs after one warmup each; thinking off, temperature zero,
 fixed output length. Decode speed excludes time to first token. *The HTML prompt reused
-its 62 cached prompt tokens; the others reused none. FP4's first-token medians were 2.01 s
-(essay), 0.41 s (HTML) and 1.25 s (Python). These are short throughput checks, not
+its 62 cached prompt tokens; the others reused none. FP4's first-token medians were 1.44 s
+(essay), 0.53 s (HTML) and 1.29 s (Python). These are short throughput checks, not
 answer-quality tests. Prompt content,
 draft acceptance, expert history and cache reuse affect speed. See [full results](RESULTS.md).
 
@@ -103,8 +104,8 @@ Cold prefill (uncached random-word prompts; medians of 5 at 8K and 2 at 32K):
 
 | Prompt | EXL3 | FP4 | FP4 before 2026-10-08 |
 | --- | ---: | ---: | ---: |
-| 8K | **1,203 tok/s** (6.8 s) | 1,045 tok/s (7.8 s) | 390–470 tok/s (17–21 s) |
-| 32K | **1,452 tok/s** (22.6 s) | 1,257 tok/s (26.1 s) | 470 tok/s (70 s) |
+| 8K | **1,401 tok/s** (5.9 s) | 988 tok/s (8.3 s) | 390–470 tok/s (17–21 s) |
+| 32K | **1,545 tok/s** (21.2 s) | 1,325 tok/s (24.7 s) | 470 tok/s (70 s) |
 
 The first requests after a boot or profile switch run 1.5–3x slower while adaptation moves
 experts and kernels warm up. Prefill switches: `DSV41_ENGRAM_DIRECT=prefill`,
@@ -127,7 +128,10 @@ Switches: `DSV41_ATTN_STAGED=2`, `DSV41_ROUTER_BF16=1`, `DSV41_HC_KERNEL=1`. Dra
 `DSV41_TP_DRAFT_ATTN=1`. Kernels: `DSV41_FP8_DECODE_BLOCK_N=32`, `DSV41_FP8_DECODE_BLOCK_K=256`,
 `DSV41_LEAN_RMS_FUSED=1`, `DSV41_HC_FRONT_FUSED=1`. Paired 22-prompt averages: **+9%**,
 **+2.3%** and **+2.1%**, **+1.8%** and **+4.0%**. The EXL3 draft blocks (`DSV41_EXL3_DRAFT_DENSE=1`,
-default since 2026-10-11): **-1.05 ± 0.37 ms** a step paired, outputs identical. Both profiles also queue the next draft
+default since 2026-10-11): **-1.05 ± 0.37 ms** a step paired, outputs identical. The listed draft
+vocabulary (`DSV41_DRAFT_VOCAB`): **-1.06 ± 0.37 ms**, outputs identical. Expert top-p 0.90
+(`DSV41_EXPERT_TOPP`, lossy): **-2.22 ± 0.22 ms** (FP4) and **-1.91 ± 0.39 ms** (EXL3), held-out loss
+unchanged within ±0.006 nats. Both profiles also queue the next draft
 before the host reads each verify result (`DSV41_EARLY_DRAFT`/`DSV41_EARLY_VERIFY`, on by
 default): -2.0 ± 0.5 ms a step, outputs bit-identical.
 
@@ -241,7 +245,7 @@ The partial checkpoint can be deleted afterwards. To skip the EXL3 download enti
 
 `/health` shows `"expert_format": "fp4"` and `"kernel": "triton-fp4"`. At the same
 `ARENA_GB=92.3`, FP4 keeps 9,793 experts resident (64%) where EXL3 keeps 13,813, and
-decodes 10-13% slower ([table](#exl3-default-or-fp4-experts)). In exchange, the experts
+decodes 3-14% slower ([table](#exl3-default-or-fp4-experts)). In exchange, the experts
 are the checkpoint's own weights rather than a 2.9 bpw requantization (2-bit in layers
 18-22). **In our own use FP4 has sometimes given better answers**, for example on
 detailed security questions. That is an observation, not a measured result: our quality
